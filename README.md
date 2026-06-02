@@ -63,15 +63,14 @@ git clone --recursive https://github.com/lhooz/embodied_hornet.git
 cd embodied_hornet
 ```
 
-### 2. Clone neuro-symbolic-slam separately
+> **Note:** The `neuro-symbolic-slam` submodule contains large binary files. If the clone stalls, run:
+> ```bash
+> git submodule update --init --reference /path/to/local/neuro-symbolic-slam neuro-symbolic-slam
+> # or shallow:
+> git submodule update --init --depth 1 neuro-symbolic-slam
+> ```
 
-The SLAM repo contains large binary files and cannot be registered as a git submodule reliably. Clone it manually into the project root:
-
-```bash
-git clone --depth 1 https://github.com/lhooz/neuro-symbolic-slam.git
-```
-
-### 3. Install dependencies
+### 2. Install dependencies
 
 ```bash
 pip install -e .
@@ -79,7 +78,7 @@ pip install -e .
 # source ../.venv/bin/activate
 ```
 
-### 4. Run training
+### 3. Run training
 
 ```bash
 JAX_PLATFORMS=cpu python -m embodied_hornet.train
@@ -104,7 +103,7 @@ All integration code lives in `embodied_hornet/` (this package). The three depen
 
 | Repo | Role | Linked as |
 |:---|:---|:---|
-| [neuro-symbolic-slam](https://github.com/lhooz/neuro-symbolic-slam) | Spiking CANN pose tracking, STDP vision, HDC place cells | shallow clone |
+| [neuro-symbolic-slam](https://github.com/lhooz/neuro-symbolic-slam) | Spiking CANN pose tracking, STDP vision, HDC place cells | git submodule |
 | [hornetRL](https://github.com/lhooz/hornetRL) | Port-Hamiltonian flight controller, ICNN energy shaping, spiking CPG | git submodule |
 | [fly_surrogate](https://github.com/lhooz/fly_surrogate) | Differentiable aerodynamic surrogate (Taichi LBM fluid solver) | git submodule |
 

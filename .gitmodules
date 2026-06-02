@@ -4,3 +4,6 @@
 [submodule "fly_surrogate"]
 	path = fly_surrogate
 	url = https://github.com/lhooz/fly_surrogate.git
+[submodule "neuro-symbolic-slam"]
+	path = neuro-symbolic-slam
+	url = https://github.com/lhooz/neuro-symbolic-slam.git
