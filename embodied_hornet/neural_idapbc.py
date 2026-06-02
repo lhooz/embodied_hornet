@@ -3,13 +3,18 @@ embodied_hornet/neural_idapbc.py
 
 Integration extensions to hornetRL's IDA-PBC controller.
 Imports all base classes from the hornetRL submodule and adds:
-  - IDA_PBC_Hover: boosted-damping passivity controller for spatial re-localisation
-  - hover_stable(): Lyapunov-stable hover policy interface
+  - hover_stable(): Pure JAX Lyapunov-stable hover policy (no haiku modules)
   - differentiable_attention_gate(): DNAG smooth blending based on SLAM surprise
+
+NOTE: IDA_PBC_Hover was previously an hk.Module using a random ICNN, which
+(a) required hk.transform and broke jax.vmap, and (b) provided no stability
+guarantee since the ICNN was never trained. It is replaced with an analytical
+quadratic energy controller: V(e) = 0.5*||e||^2, grad_V = e -- provably
+Lyapunov-stable. BiologicalKinematicMap (also hk.Module) is replaced with
+an equivalent fixed analytical mapping.
 """
 import jax
 import jax.numpy as jnp
-import haiku as hk
 
 # --- ALL BASE CLASSES FROM hornetRL SUBMODULE (unmodified) ---
 from hornetRL.neural_idapbc import (
@@ -19,70 +24,83 @@ from hornetRL.neural_idapbc import (
     policy_network_icnn,
     unpack_action,
 )
-from hornetRL.neural_cpg import BiologicalKinematicMap
 
 # ==============================================================================
-# NEW: SAFETY — IDA-PBC LYAPUNOV HOVERING CONTROLLER
-# ==============================================================================
-class IDA_PBC_Hover(hk.Module):
-    """
-    Dedicated passivity-based hovering controller with boosted damping injection
-    to act as a Lyapunov-stable active brake during spatial re-localization.
-
-    Unlike NeuralIDAPBC_ICNN (which learns dynamic damping), this controller
-    uses fixed, amplified damping to guarantee kinetic energy dissipation
-    regardless of the learned policy state.
-    """
-    def __init__(self, target_state):
-        super().__init__()
-        raw_target_q = target_state[:4]
-        self.target_q = raw_target_q * ScaleConfig.OBS_SCALE[:4]
-        self.icnn = ICNN(name="hover_icnn")
-
-    def __call__(self, x):
-        q = x[..., :4]
-        p = x[..., 4:]
-        error = q - self.target_q
-
-        # Energy shaping gradient
-        def energy_fn(e): return jnp.sum(self.icnn(e))
-        raw_grad = jax.grad(energy_fn)(error)
-        grad_Va = raw_grad * ScaleConfig.CONTROL_SCALE
-
-        # Boosted Damping Injection (2.5x range, 5x base) — active braking
-        damping_gains = (2.5 * ScaleConfig.DAMPING_SCALE) + 5.0 * ScaleConfig.DAMPING_BASE
-        damping_force = -damping_gains * p
-
-        return -grad_Va + damping_force
-
-
-# ==============================================================================
-# NEW: LYAPUNOV STABLE HOVERING INTERFACE
+# SAFETY -- PURE JAX LYAPUNOV HOVERING CONTROLLER
 # ==============================================================================
 def hover_stable(x, target_state=None):
     """
-    Lyapunov-stable active hovering policy mapping observations to CPG modulations.
-    Invoked when spatial uncertainty/Surprise is high to arrest kinetic energy.
+    Pure JAX Lyapunov-stable hover policy mapping observations to CPG modulations.
+    Invoked (via DNAG) when spatial uncertainty / SLAM Surprise is high, to
+    arrest kinetic energy and hold position.
+
+    Replaces the previous hk.Module-based IDA_PBC_Hover + BiologicalKinematicMap
+    pair, which required hk.transform and was incompatible with bare jax.vmap.
+
+    Energy shaping:
+        V(e) = 0.5 * ||e||^2  ->  grad_V = e  (quadratic, provably Lyapunov-stable)
+        (Previous ICNN had random weights and was never trained -- no stability
+        guarantee. Quadratic is a strict improvement.)
+
+    Force -> modulation mapping:
+        Fixed analytical mapping mirroring BiologicalKinematicMap output structure.
+        Ensures hover_mods stay in the same 9D space as policy_mods so DNAG
+        blending is meaningful.
+
+    Args:
+        x:            (8,) observation [x, z, theta, phi, vx, vz, w_theta, w_phi]
+        target_state: (8,) target state (default: hover at origin, theta=1.0)
+
+    Returns:
+        modulations_vector: (9,) CPG modulation vector (same space as policy_mods)
+        u_forces:           (4,) raw force command [Fx, Fz, Tau_theta, Tau_phi]
     """
     if target_state is None:
         target_state = jnp.array([0.0, 0.0, 1.0, 0.2, 0.0, 0.0, 0.0, 0.0])
 
-    x_in = x * ScaleConfig.OBS_SCALE
+    x_in = x * ScaleConfig.OBS_SCALE          # scale to internal units
+    q    = x_in[:4]                            # position-like states (scaled)
+    p    = x_in[4:]                            # momentum-like states (scaled)
 
-    brain = IDA_PBC_Hover(target_state)
-    u_forces = brain(x_in)
+    target_q = target_state[:4] * ScaleConfig.OBS_SCALE[:4]
+    error    = q - target_q                    # position error in scaled space
 
-    u_forces_saturated = jnp.tanh(u_forces / ScaleConfig.CONTROL_SCALE)
+    # --- Quadratic Energy Shaping: V(e) = 0.5*||e||^2, grad_V = e ---
+    grad_Va = error * ScaleConfig.CONTROL_SCALE
 
-    muscles = BiologicalKinematicMap()
-    mod_tuple = muscles(u_forces_saturated)
-    modulations_vector = jnp.stack(mod_tuple, axis=-1)
+    # --- Boosted Damping Injection (2.5x range, 5x base) -- active braking ---
+    damping_gains = 2.5 * ScaleConfig.DAMPING_SCALE + 5.0 * ScaleConfig.DAMPING_BASE
+    damping_force = -damping_gains * p
+
+    u_forces = -grad_Va + damping_force        # (4,) physical force command
+
+    # --- Saturate to [-1, 1] for kinematic mapping ---
+    u_sat = jnp.tanh(u_forces / ScaleConfig.CONTROL_SCALE)   # (4,) in [-1, 1]
+
+    # --- Fixed Analytical Force -> 9D CPG Modulation Mapping ---
+    # Mirrors BiologicalKinematicMap's output structure and scaling with fixed gains.
+    # Output: [d_freq, d_amp, bias, pitch_off, dev_amp, abd_tau, aoa_dn, aoa_up, dev_phase]
+    d_freq     = u_sat[1] * 1000.0                              # Fz  -> frequency
+    d_amp      = u_sat[1] * 0.4                                 # Fz  -> amplitude
+    bias       = jnp.clip(u_sat[0] * 0.0035, -0.0035, 0.0035)  # Fx  -> stroke bias
+    pitch_off  = jnp.clip(u_sat[2] * 0.5,    -0.5,    0.5)     # Tau_theta -> pitch phase
+    dev_amp    = jnp.clip(u_sat[0] * 0.006,  -0.006,  0.006)   # Fx  -> deviation amp
+    abd_torque = u_sat[3] * 2e-4                                 # Tau_phi -> abdomen
+    aoa_down   = jnp.clip(0.75 + u_sat[2] * 0.75, 0.0, 1.5)   # Tau_theta -> AoA down
+    aoa_up     = jnp.clip(0.75 + u_sat[2] * 0.75, 0.0, 1.5)   # Tau_theta -> AoA up
+    dev_phase  = u_sat[0] * 0.1                                  # Fx  -> deviation phase
+
+    modulations_vector = jnp.stack(
+        [d_freq, d_amp, bias, pitch_off, dev_amp,
+         abd_torque, aoa_down, aoa_up, dev_phase],
+        axis=-1
+    )                                          # (9,) -- same shape as policy_mods
 
     return modulations_vector, u_forces
 
 
 # ==============================================================================
-# NEW: DIFFERENTIABLE NEUROMODULATORY ATTENTION GATE (DNAG)
+# DIFFERENTIABLE NEUROMODULATORY ATTENTION GATE (DNAG)
 # ==============================================================================
 def differentiable_attention_gate(surprise, policy_mods, hover_mods, gamma=15.0):
     """
