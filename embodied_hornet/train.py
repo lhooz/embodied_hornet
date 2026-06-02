@@ -59,9 +59,12 @@ class Config:
     PBT_INTERVAL = 500      
 
     BATCH_SIZE = 32          
-    LR_ACTOR = 5e-4         
-    MAX_GRAD_NORM = 1.0     
-    GAMMA = 0.99            
+    LR_ACTOR = 5e-4
+    LR_WARMUP_STEPS = 50        # ramp LR from LR_ACTOR/50 → LR_ACTOR over this many steps
+    MAX_GRAD_NORM = 1.0
+    GAMMA = 0.99
+    DNAG_MIN_ALPHA = 0.3        # hover specialist always contributes ≥30% of the blend
+                                # prevents SHAC's random critic from destroying hover stability
 
     OBS_NOISE_SIGMA = 0.002  
     ACTION_NOISE_SIGMA = 0.2
@@ -398,9 +401,14 @@ def train():
         single_params = expert_data['params']
         params = jax.tree.map(lambda x: jnp.stack([x] * Config.BATCH_SIZE), single_params)
         
+        _lr_schedule = optax.linear_schedule(
+            init_value=Config.LR_ACTOR / 50.0,
+            end_value=Config.LR_ACTOR,
+            transition_steps=Config.LR_WARMUP_STEPS,
+        )
         optimizer = optax.chain(
             optax.clip_by_global_norm(Config.MAX_GRAD_NORM),
-            optax.adam(Config.LR_ACTOR)
+            optax.adam(_lr_schedule)
         )
         opt_state = optimizer.init(params)
         pbt_state = init_pbt_state(rng, Config.BATCH_SIZE, Config.PBT_BASE_WEIGHTS)
@@ -437,9 +445,14 @@ def train():
         else:
             print("--> [WARM-START] hover_params.pkl not found — keeping random init (expect NaN at step 0)")
 
+        _lr_schedule = optax.linear_schedule(
+            init_value=Config.LR_ACTOR / 50.0,
+            end_value=Config.LR_ACTOR,
+            transition_steps=Config.LR_WARMUP_STEPS,
+        )
         optimizer = optax.chain(
             optax.clip_by_global_norm(Config.MAX_GRAD_NORM),
-            optax.adam(Config.LR_ACTOR)
+            optax.adam(_lr_schedule)
         )
         opt_state = optimizer.init(params)
         pbt_state = init_pbt_state(rng, Config.BATCH_SIZE, Config.PBT_BASE_WEIGHTS)
@@ -559,8 +572,15 @@ def train():
                 hover_obs     = jnp.concatenate([symlog(hover_obs_raw), curr_weighted_belief], axis=-1)
                 hover_mods, _, _ = batched_network(params, hover_obs, jnp.zeros((B, 4)))
 
-            # Fully differentiable attention gate blending
+            # Fully differentiable attention gate blending.
+            # DNAG_MIN_ALPHA enforces a hover-specialist floor: even when SLAM
+            # surprise is near zero (familiar territory / near target), the hover
+            # specialist always contributes at least MIN_ALPHA of the action.
+            # This prevents the SHAC policy's random critic from fully overriding
+            # the hover-stable ICNN weights during early training.
             blended_mods, alpha = jax.vmap(differentiable_attention_gate)(sim_surprise, mods, hover_mods)
+            alpha_floored = jnp.maximum(alpha, Config.DNAG_MIN_ALPHA)
+            blended_mods  = (1.0 - alpha_floored) * mods + alpha_floored * hover_mods
             
             # 4. Environment Step (Physics uses the blended passivity-preserving actions)
             next_full, f_actual, _, _, _ = env.step_batch(curr_full, blended_mods, step_idx=p_idx)
