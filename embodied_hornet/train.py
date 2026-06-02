@@ -360,14 +360,29 @@ def train():
         with open(_hover_pkl, "rb") as _f:
             _hover_ckpt = pickle.load(_f)
         hover_fixed_params = jax.tree.map(jnp.array, _hover_ckpt['params'])
+        _hover_batch = jax.tree.leaves(hover_fixed_params)[0].shape[0]
         _use_hover_specialist = True
         print(f"--> [HOVER] Loaded hover specialist from hover_params.pkl "
-              f"(batch={hover_fixed_params['biological_kinematic_map']['~']['linear']['w'].shape[0]})")
+              f"(batch={_hover_batch}, keys={list(hover_fixed_params.keys())})")
     else:
         print("--> [HOVER] hover_params.pkl not found — using velocity-zeroed policy fallback.")
 
     # Batched hover network (vmapped over 32-agent PBT population)
     batched_hover_network = jax.vmap(hover_ac_model.apply)
+
+    # Validate hover specialist with a dry-run forward pass before JIT
+    if _use_hover_specialist:
+        try:
+            _dummy_8d   = jnp.zeros((_hover_batch, 8))
+            _dummy_act  = jnp.zeros((_hover_batch, 4))
+            _test_mods, _, _ = batched_hover_network(hover_fixed_params, _dummy_8d, _dummy_act)
+            print(f"    -> Hover specialist validated: mods shape {_test_mods.shape}")
+        except Exception as _e:
+            print(f"    -> WARNING: hover specialist forward-pass failed ({_e})")
+            print(f"       Param keys: {list(hover_fixed_params.keys())}")
+            print(f"       Falling back to velocity-zeroed policy.")
+            _use_hover_specialist = False
+            hover_fixed_params    = None
 
     def loss_fn(params, start_state, pbt_weights, key, slam_pose, slam_surprise):
         """
