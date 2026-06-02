@@ -26,6 +26,11 @@ from hornetRL.fly_system import FlappingFlySystem, PhysParams
 from hornetRL.neural_cpg import OscillatorState, step_oscillator, get_wing_kinematics
 from hornetRL.pbt_manager import init_pbt_state, pbt_evolve
 
+# --- SLAM SYSTEM FROM neuro-symbolic-slam SUBMODULE ---
+# (sys.path for src/ is configured in embodied_hornet/__init__.py)
+from snn_slam_system import SNNSLAMSystem, N_DEPTH
+from sparse_forest import N_PIXELS
+
 # ==============================================================================
 # 1. CONFIGURATION
 # ==============================================================================
@@ -317,10 +322,14 @@ def train():
 
     print(f"--> Initialization Complete. Params Batch Shape: {params['linear']['w'].shape}")
 
-    def loss_fn(params, start_state, pbt_weights, key):
+    def loss_fn(params, start_state, pbt_weights, key, slam_pose, slam_surprise):
         """
         Computes the total loss over the trajectory horizon.
         Includes policy gradient, value function loss, and auxiliary force matching loss.
+
+        slam_pose:     (3,) JAX array  [slam_x, slam_y, slam_heading] in 10m SLAM space.
+                       Converted to hornet metres before being fed to the Instar routing.
+        slam_surprise: scalar float  in [0, 1]  — 1.0 = fully novel scene, 0.0 = familiar.
         """
         rollout_indices = jnp.arange(Config.HORIZON)
         phys_indices = rollout_indices + Config.WARMUP_STEPS + 5
@@ -329,14 +338,19 @@ def train():
         # We also pass a running observation state as a carry: start with zeros for the perceptual feedback
         B = Config.BATCH_SIZE
         initial_weighted_belief = jnp.zeros((B, 4))
-        # Carry previous visual features for visual-similarity-based surprise (matches SLAM's 1−Raw_Match)
-        initial_prev_visual = jnp.zeros((B, 256))
+        
+        # Convert SLAM pose from 10m space → hornet physical metres for Instar routing
+        # slam_pose[:2] = (x, y) in 10m space;  slam_pose[2] = heading (same units)
+        slam_xy_hornet = (slam_pose[:2] - _SLAM_OFFSET_TRAIN) / env._slam_scale
+        slam_pose_hornet = jnp.concatenate([slam_xy_hornet, slam_pose[2:3]])  # (3,)
+        frozen_pose  = jnp.broadcast_to(slam_pose_hornet, (B, 3))    # same pose for all agents
+        frozen_surp  = jnp.full((B,), slam_surprise)                  # same surprise for all agents
         
         scan_inputs = (rollout_indices, phys_indices, scan_keys)
-        init_carry = (start_state, initial_weighted_belief, initial_prev_visual)
+        init_carry = (start_state, initial_weighted_belief)
 
         def scan_fn(carry, xs): 
-            curr_full, curr_weighted_belief, prev_visual = carry
+            curr_full, curr_weighted_belief = carry
             r_idx, p_idx, step_key = xs
             
             curr_robot = curr_full[0]
@@ -362,20 +376,13 @@ def train():
             mods, u_brain, _ = batched_network(params, combined_obs, action_noise)
             
             # --- LYAPUNOV HOVER & ATTENTION GATING (DNAG) ---
-            # Visual-similarity-based Surprise (matches SLAM's S = 1.0 − Raw_Match)
-            # Compute cosine similarity between consecutive CSNN frames
-            vis_base = curr_robot[:, :2]
-            key_vis, key_step_rest = jax.random.split(step_key)
-            curr_visual = jax.random.normal(key_vis, shape=(B, 256)) * 0.05
-            curr_visual = curr_visual.at[:, :2].add(vis_base)
-            curr_visual = curr_visual / (jnp.linalg.norm(curr_visual, axis=-1, keepdims=True) + 1e-8)
-            
-            # Cosine similarity → surprise (1.0 = completely novel, 0.0 = perfect match)
-            cos_sim = jnp.sum(prev_visual * curr_visual, axis=-1)  # (B,)
-            vis_surprise = jnp.clip(1.0 - cos_sim, 0.0, 1.0)
-            # Floor: use positional distance as a lower bound to bootstrap when prev_visual is zeros
-            dist_floor = jnp.clip(jnp.sqrt(jnp.sum((curr_robot[:, :2] - Config.TARGET_STATE[:2])**2, axis=-1) + 1e-8) * 2.0, 0.0, 1.0)
-            sim_surprise = jnp.maximum(vis_surprise, dist_floor)
+            # Use real SLAM surprise (frozen for this 32-step horizon).
+            # Floor with positional distance so DNAG engages even before SLAM warms up.
+            dist_floor = jnp.clip(
+                jnp.sqrt(jnp.sum((curr_robot[:, :2] - Config.TARGET_STATE[:2])**2, axis=-1) + 1e-8) * 2.0,
+                0.0, 1.0
+            )
+            sim_surprise = jnp.maximum(frozen_surp, dist_floor)
             
             # Brain-to-muscle mapping for active IDA-PBC Hover stabilization
             hover_mods, _ = jax.vmap(hover_stable)(noisy_obs)
@@ -386,20 +393,15 @@ def train():
             # 4. Environment Step (Physics uses the blended passivity-preserving actions)
             next_full, f_actual, _, _, _ = env.step_batch(curr_full, blended_mods, step_idx=p_idx)
             
-            # --- SIMULATE PERCEPTUAL STREAM INGESTION (460 Hz) ---
-            # Reuse the visual frame computed for surprise (CSNN) and generate STDP
-            norm_csnn = curr_visual  # Already computed above for surprise
+            # --- PERCEPTUAL STREAM INGESTION (460 Hz Instar routing) ---
+            # Use real SLAM pose + small noise as the pose_belief fed into Instar.
+            # CSNN/STDP placeholders: replaced by real SLAM visual features in a future pass.
+            key_stdp, _ = jax.random.split(key_step)
+            pose_belief = frozen_pose + jax.random.normal(key_step, shape=(B, 3)) * 0.01
 
-            key_stdp, _ = jax.random.split(key_step_rest)
-            next_robot = next_full[0]
-            vis_base_next = next_robot[:, :2]
-            norm_stdp = jax.random.normal(key_stdp, shape=(B, 256)) * 0.05
-            norm_stdp = norm_stdp.at[:, :2].add(vis_base_next)
-            norm_stdp = norm_stdp / (jnp.linalg.norm(norm_stdp, axis=-1, keepdims=True) + 1e-8)
+            norm_csnn = jnp.zeros((B, 256))  # real CSNN from SLAM debug_gates['Debug_Input_CSNN']
+            norm_stdp  = jnp.zeros((B, 256))  # real STDP from SLAM debug_gates['Debug_Input_STDP']
             visual_features = (norm_csnn, norm_stdp)
-            
-            # Route believed pose
-            pose_belief = curr_robot[:, :3] + jax.random.normal(key_step, shape=(B, 3)) * 0.005
             
             # Update Instar Weights & Project weighted belief for the next control step
             next_full, next_weighted_belief = env.ingest_perceptual_streams(
@@ -424,9 +426,9 @@ def train():
                 met['ang_th'], met['ang_ab'], 
                 met['vel_lin'], met['vel_ang']
             )
-            return (next_full, next_weighted_belief, curr_visual), step_metrics
+            return (next_full, next_weighted_belief), step_metrics
 
-        (final_full, final_weighted_belief, _final_visual), step_results = jax.lax.scan(
+        (final_full, final_weighted_belief), step_results = jax.lax.scan(
             scan_fn, init_carry, scan_inputs
         )
         
@@ -482,12 +484,15 @@ def train():
         }
         return total_loss, (logs, final_full)
 
+    # Constant needed inside loss_fn (mirrors env._SLAM_OFFSET)
+    _SLAM_OFFSET_TRAIN = 5.0
+
     @jax.jit
-    def update(params, opt_state, full_state, pbt_state, key): 
+    def update(params, opt_state, full_state, pbt_state, key, slam_pose, slam_surprise):
         key_loss, key_next = jax.random.split(key)
         
         (loss, (logs, next_state)), grads = jax.value_and_grad(loss_fn, has_aux=True)(
-            params, full_state, pbt_state.weights, key_loss
+            params, full_state, pbt_state.weights, key_loss, slam_pose, slam_surprise
         )
         
         updates, new_opt = optimizer.update(grads, opt_state, params)
@@ -504,12 +509,35 @@ def train():
     rng, key_reset = jax.random.split(rng)
     curr_state = env.reset(key_reset, Config.BATCH_SIZE)
     
+    # --- Initialise SLAM System ---
+    # One SNNSLAMSystem tracks agent-0's trajectory and provides real pose + surprise
+    # to the DNAG gate.  It runs OUTSIDE the JAX JIT loop (Python-native).
+    print("---> Initialising SNNSLAMSystem (agent-0 tracker)...")
+    slam_system = SNNSLAMSystem(jax.random.PRNGKey(7), n_depth=N_DEPTH)
+    slam_system.reset(1)
+
+    # Bootstrap SLAM from agent-0's initial pose (centre of 10m room)
+    init_robot0  = np.array(curr_state[0][0])            # (8,) hornet state
+    init_slam_x  = float(init_robot0[0]) * env._slam_scale + 5.0
+    init_slam_z  = float(init_robot0[1]) * env._slam_scale + 5.0
+    init_slam_th = float(init_robot0[2])
+    slam_system.initialize_from_gt(
+        jnp.array([[init_slam_x, init_slam_z]]),
+        jnp.array([init_slam_th]),
+    )
+
+    # SLAM state carried between outer loop iterations
+    slam_pose     = jnp.array([init_slam_x, init_slam_z, init_slam_th])  # (3,)
+    slam_surprise = 0.0                                                    # float
+    slam_prev_int = np.zeros(N_PIXELS, dtype=np.float32)                  # event delta baseline
+    print(f"    -> SLAM initialised at ({init_slam_x:.2f}, {init_slam_z:.2f}) m, heading {init_slam_th:.2f} rad")
+    
     # --- JIT Compilation ---
-    print("--> Compiling JAX Update...")
+    print("---> Compiling JAX Update...")
     t0 = time.time()
     key_compile = jax.random.PRNGKey(0)
-    _ = update(params, opt_state, curr_state, pbt_state, key_compile) 
-    print(f"--> Compilation Finished in {time.time() - t0:.2f}s")
+    _ = update(params, opt_state, curr_state, pbt_state, key_compile, slam_pose, jnp.array(slam_surprise))
+    print(f"---> Compilation Finished in {time.time() - t0:.2f}s")
 
     # --- Main Loop ---
     key_explore = jax.random.PRNGKey(999) 
@@ -524,8 +552,31 @@ def train():
 
         # 1. Update Step
         params, opt_state, loss, logs, next_state, pbt_state, key_explore = update(
-            params, opt_state, curr_state, pbt_state, key_explore
+            params, opt_state, curr_state, pbt_state, key_explore,
+            slam_pose, jnp.array(slam_surprise)
         )
+
+        # 1b. SLAM update (outside JIT, runs on agent-0's terminal state)
+        # Compute sensor bundle from the final state of this horizon
+        robot0_np = np.array(next_state[0][0])  # (8,) agent-0 hornet state
+        ev_jax, kin_jax, tof_jax, slam_prev_int = env.compute_slam_sensors(
+            robot0_np, slam_prev_int
+        )
+        # Run one SLAM step (closed-loop with full memory + loop closure detection)
+        try:
+            pose_est, _, _, _, _, debug_gates = slam_system.forward_step(
+                ev_jax, kin_jax, tof_jax,
+                inject_drift=False, autopilot_on=(slam_surprise < 0.60)
+            )
+            slam_pose     = jnp.array([
+                float(pose_est[0, 0]),   # x in 10m space
+                float(pose_est[0, 1]),   # y in 10m space
+                float(pose_est[0, 2]),   # heading
+            ])
+            slam_surprise = float(1.0 - float(debug_gates['Raw_Match'][0]))
+        except Exception as _slam_err:
+            # Graceful fallback: keep previous SLAM values
+            print(f"    [SLAM] non-fatal error at step {i}: {_slam_err}")
     
         # 2. Stability Checks
         if jnp.isnan(loss):

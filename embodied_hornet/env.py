@@ -1,11 +1,42 @@
 import jax
 import jax.numpy as jnp
+import numpy as np
 from typing import Tuple, Dict, Any
 
 # --- MODULES FROM hornetRL SIBLING REPO ---
 from hornetRL.fly_system import FlappingFlySystem, PhysParams
 from hornetRL.neural_cpg import OscillatorState, step_oscillator, get_wing_kinematics
 from hornetRL.neural_idapbc import unpack_action
+
+# --- SENSOR FUNCTIONS FROM neuro-symbolic-slam SUBMODULE ---
+# (resolved via sys.path set in embodied_hornet/__init__.py)
+from sparse_forest import (
+    generate_obstacles,
+    obstacles_to_segments,
+    compute_pixel_readings,
+    compute_tof_distance,
+    _precompute_barcode_tensors,
+    _generate_surface_textures,
+    THRESHOLD,
+    N_PIXELS,
+)
+
+# ==============================================================================
+# SLAM COORDINATE MAPPING
+# ==============================================================================
+# The hornet flies in a physical arena of ±ARENA_W metres.
+# sparse_forest generates a 10m × 10m room with biologically-scaled obstacles
+# (0.1-0.7m in 10m-space ≈ 1-7mm at hornet scale — twigs/stems).
+# We linearly map hornet coordinates into this 10m room so the SLAM system
+# receives sensor data in its native coordinate frame.
+#
+#   slam_coord = hornet_coord * SLAM_SCALE + SLAM_OFFSET
+#   SLAM_SCALE = 5.0 / ARENA_W   →  [-ARENA_W, ARENA_W] maps to [0.5, 9.5] m
+#   SLAM_OFFSET = 5.0            →  centres the hornet in the room
+#
+# The SLAM map, poses, and loop closures are all in 10m space.
+# Only the Instar routing uses pose_belief converted BACK to hornet metres.
+_SLAM_OFFSET = 5.0   # centre of the 10m room
 
 # ==============================================================================
 # ROBUST ENVIRONMENT
@@ -21,16 +52,47 @@ class FlyEnv:
     def __init__(self, config):
         """
         Args:
-            config: A configuration class or object containing constants like 
-                    BASE_FREQ, TARGET_STATE, DT, etc.
+            config: A configuration class or object containing constants like
+                    BASE_FREQ, TARGET_STATE, DT, ARENA_W, etc.
         """
         self.cfg = config
-        
+
         self.phys = FlappingFlySystem(
-            model_path='fluid.pkl', 
-            target_freq=config.BASE_FREQ 
+            model_path='fluid.pkl',
+            target_freq=config.BASE_FREQ
         )
         self.target = config.TARGET_STATE
+
+        # --- Arena geometry for SLAM sensor generation ---
+        # Scale factor: maps hornet ±ARENA_W metres into [0.5, 9.5] of the 10m room.
+        self._slam_scale  = _SLAM_OFFSET / getattr(config, 'ARENA_W', 0.45)
+        self._obstacles   = None  # set by _init_arena()
+        self._segments    = None
+        self._tex_tensor  = None
+        self._init_arena(seed=42)
+
+    # ------------------------------------------------------------------
+    def _init_arena(self, seed: int = 42):
+        """
+        Generates a fixed 10m × 10m obstacle room (used for the entire
+        training run so that SLAM can build a persistent map).
+        Called once in __init__; safe to call again to regenerate.
+        """
+        rng = np.random.RandomState(seed)
+        k_obs = jax.random.PRNGKey(rng.randint(0, 2**31))
+
+        obstacles_jax      = generate_obstacles(k_obs)
+        segments_jax       = obstacles_to_segments(obstacles_jax)
+        obstacles_np       = np.array(obstacles_jax)
+        room_seed          = int(rng.randint(0, 2**31))
+        surface_textures   = _generate_surface_textures(obstacles_np, room_seed)
+        tex_tensor         = _precompute_barcode_tensors(surface_textures, obstacles_np)
+
+        self._obstacles  = obstacles_jax
+        self._segments   = segments_jax
+        self._tex_tensor = tex_tensor
+        print(f"---> Arena: 10m×10m room, {len(obstacles_np)} obstacles "
+              f"(SLAM scale {self._slam_scale:.2f}×, offset {_SLAM_OFFSET:.1f}m)")
 
     def reset(self, key, batch_size):
         """
@@ -365,3 +427,67 @@ class FlyEnv:
             'ang': loss_ang_thorax + loss_ang_abdomen
         }
         return scaled_reward, metrics
+
+    # ------------------------------------------------------------------
+    def compute_slam_sensors(
+        self,
+        robot_state_single: np.ndarray,
+        prev_intensities: np.ndarray,
+    ):
+        """
+        Computes event-camera, ToF, and kinematic odometry for ONE agent.
+
+        Called OUTSIDE JAX JIT in the main training loop — not inside scan.
+        The results are fed directly to SNNSLAMSystem.forward_step().
+
+        Args:
+            robot_state_single: (8,) numpy array  [x, z, theta, phi, vx, vz, w_theta, w_phi]
+            prev_intensities:   (N_PIXELS,) numpy array — intensity frame from previous call
+
+        Returns:
+            ev_jax:        (1, N_PIXELS) JAX array  — event frame (batched for SLAM)
+            kin_jax:       (1, 3) JAX array          — [vx_slam, vz_slam, w_theta]
+            tof_jax:       (1, 3) JAX array          — 3-beam ToF distances (m, SLAM space)
+            intensities:   (N_PIXELS,) numpy array   — current frame (store for next call)
+        """
+        # 1. Map hornet (x, z) → 10m SLAM coordinate frame
+        slam_pos = jnp.array([
+            float(robot_state_single[0]) * self._slam_scale + _SLAM_OFFSET,
+            float(robot_state_single[1]) * self._slam_scale + _SLAM_OFFSET,
+        ])
+        heading = float(robot_state_single[2])
+
+        # 2. Event camera (256 pixels, 90° FOV)
+        intensities_jax, _, _, _ = compute_pixel_readings(
+            slam_pos, heading, self._segments,
+            obstacles=self._obstacles, tex_tensor=self._tex_tensor,
+        )
+        intensities = np.array(intensities_jax)
+        delta       = intensities - prev_intensities
+        events      = np.where(delta >  THRESHOLD,  1.0,
+                      np.where(delta < -THRESHOLD, -1.0, 0.0)).astype(np.float32)
+
+        # 3. ToF (3-beam, values in SLAM metres; SLAM handles range internally)
+        tof_jax = compute_tof_distance(slam_pos, heading, self._segments)
+
+        # 4. Kinematic odometry [vx, vz, w_theta] (physical hornet units — m/s, rad/s)
+        kin = np.array(robot_state_single[4:7], dtype=np.float32)
+
+        # Return batched (B=1) JAX arrays matching SNNSLAMSystem.forward_step() signature
+        ev_jax  = jnp.array(events[None, :])          # (1, N_PIXELS)
+        kin_jax = jnp.array(kin[None, :])              # (1, 3)
+        tof_out = jnp.array(tof_jax[None, :])          # (1, 3)
+
+        return ev_jax, kin_jax, tof_out, intensities
+
+    def slam_pose_to_hornet(self, slam_pose_xy: np.ndarray) -> np.ndarray:
+        """
+        Converts a SLAM pose (x, y) in 10m space back to hornet physical metres.
+        Useful for feeding a corrected position into the Instar routing.
+
+        Args:
+            slam_pose_xy: (2,) or (B, 2) array of [slam_x, slam_y]
+        Returns:
+            hornet_xy: same shape, in hornet physical metres
+        """
+        return (np.asarray(slam_pose_xy) - _SLAM_OFFSET) / self._slam_scale
