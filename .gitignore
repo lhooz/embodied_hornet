@@ -28,3 +28,8 @@ checkpoints_shac/
 
 # Jupyter
 .ipynb_checkpoints/
+
+# neuro-symbolic-slam is cloned manually (--depth 1) due to large binary files
+# that prevent it from being registered as a git submodule.
+# Clone with: git clone --depth 1 https://github.com/lhooz/neuro-symbolic-slam.git
+neuro-symbolic-slam/
