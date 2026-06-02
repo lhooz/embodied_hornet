@@ -31,34 +31,84 @@ Event Camera → [neuro-symbolic-slam] → Spatial Belief (3-DOF) + Visual Featu
                                     Port-Hamiltonian Dynamics → Next State
 ```
 
-## Dependencies (Sibling Repos)
+---
 
-| Repo | Path | Description |
-|:---|:---|:---|
-| [neuro-symbolic-slam](https://github.com/lhooz/neuro-symbolic-slam) | `../neuro-symbolic-slam/` | Spiking neural SLAM with CANN pose tracking, STDP vision, HDC place cells |
-| [hornetRL](https://github.com/lhooz/hornetRL) | `../hornetRL/` | Port-Hamiltonian flight controller with ICNN energy shaping and spiking CPG |
-| [fly_surrogate](https://github.com/lhooz/fly_surrogate) | `../fly_surrogate/` | Differentiable aerodynamic surrogate trained from Taichi LBM fluid solver |
+## 📂 Project Structure
 
-## Workspace Layout
-
+```text
+embodied_hornet/                        <-- This repository (integration layer)
+├── embodied_hornet/                    <-- Python integration package
+│   ├── __init__.py                     # sys.path setup for dependency resolution
+│   ├── train.py                        # Unified SHAC+PBT training loop (12-dim obs, DNAG, Instar)
+│   ├── env.py                          # FlyEnv + Asymmetric Instar perceptual routing
+│   ├── neural_idapbc.py                # IDA-PBC + hover_stable + DNAG attention gate
+│   └── snn_live_slam.py                # SLAM orchestrator + surprise telemetry
+├── hornetRL/                           <-- git submodule (base flight control, unmodified)
+├── fly_surrogate/                      <-- git submodule (aerodynamic physics, unmodified)
+├── neuro-symbolic-slam/                <-- shallow clone (large binaries; see setup below)
+├── docs/
+│   └── system_integration_report.md   # Full architectural specification
+├── pyproject.toml
+└── README.md
 ```
-workspace/
-├── neuro-symbolic-slam/   ← git repo (perception & mapping)
-├── hornetRL/              ← git repo (flight control)
-├── fly_surrogate/         ← git repo (aerodynamic physics)
-├── embodied_hornet/       ← THIS PROJECT (integration layer)
-│   ├── configs/           ← Integration-specific configuration
-│   ├── docs/              ← Architectural specs & reports
-│   └── README.md
-└── .venv/                 ← Shared Python environment
+
+---
+
+## 🚀 Setup
+
+### 1. Clone with submodules
+
+```bash
+git clone --recursive https://github.com/lhooz/embodied_hornet.git
+cd embodied_hornet
 ```
+
+### 2. Clone neuro-symbolic-slam separately
+
+The SLAM repo contains large binary files and cannot be registered as a git submodule reliably. Clone it manually into the project root:
+
+```bash
+git clone --depth 1 https://github.com/lhooz/neuro-symbolic-slam.git
+```
+
+### 3. Install dependencies
+
+```bash
+pip install -e .
+# or use the shared workspace venv:
+# source ../.venv/bin/activate
+```
+
+### 4. Run training
+
+```bash
+JAX_PLATFORMS=cpu python -m embodied_hornet.train
+```
+
+---
 
 ## Key Integration Points
 
-1. **Perception → Control routing** via Asymmetric Instar rule in `hornetRL/hornetRL/env.py`
-2. **Surprise-driven gating** via DNAG in `hornetRL/hornetRL/neural_idapbc.py`
-3. **Surprise telemetry** from `neuro-symbolic-slam/src/snn_live_slam.py`
-4. **Unified SHAC training** with visual surprise in `hornetRL/hornetRL/train.py`
+All integration code lives in `embodied_hornet/` (this package). The three dependency repos are used **unmodified**:
+
+| Module | File | What it adds |
+|:---|:---|:---|
+| `env.py` | [embodied_hornet/env.py](embodied_hornet/env.py) | `ingest_perceptual_streams()` — Asymmetric Instar rule routing 515-dim visual belief → 4-dim CPG input |
+| `neural_idapbc.py` | [embodied_hornet/neural_idapbc.py](embodied_hornet/neural_idapbc.py) | `IDA_PBC_Hover`, `hover_stable()`, `differentiable_attention_gate()` (DNAG) |
+| `train.py` | [embodied_hornet/train.py](embodied_hornet/train.py) | Unified 12-dim observation, visual-similarity surprise signal, SHAC+PBT training loop |
+| `snn_live_slam.py` | [embodied_hornet/snn_live_slam.py](embodied_hornet/snn_live_slam.py) | Surprise telemetry logging (threshold crossings for DNAG diagnostics) |
+
+---
+
+## Dependencies
+
+| Repo | Role | Linked as |
+|:---|:---|:---|
+| [neuro-symbolic-slam](https://github.com/lhooz/neuro-symbolic-slam) | Spiking CANN pose tracking, STDP vision, HDC place cells | shallow clone |
+| [hornetRL](https://github.com/lhooz/hornetRL) | Port-Hamiltonian flight controller, ICNN energy shaping, spiking CPG | git submodule |
+| [fly_surrogate](https://github.com/lhooz/fly_surrogate) | Differentiable aerodynamic surrogate (Taichi LBM fluid solver) | git submodule |
+
+---
 
 ## Technical Stack
 
@@ -67,6 +117,8 @@ workspace/
 - **Optimization:** optax (SHAC + PBT)
 - **Physics:** Port-Hamiltonian rigid body dynamics + differentiable ResNet fluid surrogates
 - **Perception:** Spiking neural networks (CANN, Ring Attractor, STDP, CSNN)
+
+---
 
 ## Reference
 
