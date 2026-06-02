@@ -339,7 +339,34 @@ def train():
         print("--> [SCRATCH] No checkpoint or expert found. Initializing random population.")
         single_params = ac_model.init(rng, dummy_input)
         params = jax.tree.map(lambda x: jnp.stack([x] * Config.BATCH_SIZE), single_params)
-        
+
+        # --- Warm-start ICNN + BiologicalKinematicMap from hover_params.pkl ---
+        # hover_params.pkl was trained to produce stable hovering. Copying its
+        # ICNN and kinematic map weights into the SHAC policy prevents NaN at
+        # step 0: random ICNN weights produce extreme gradients → huge forces →
+        # physics diverges instantly.  Only the value-head (linear/linear_1/
+        # linear_2) is kept random because its first-layer input dim is 12 here
+        # vs 8 there (not compatible).
+        #
+        # We use the FULL 32-agent PBT batch directly — each SHAC agent gets a
+        # different trained hover specialist's weights, providing diversity while
+        # ensuring all start from a numerically stable regime.
+        _hover_pkl_ws = os.path.join(os.path.dirname(__file__), "hover_params.pkl")
+        if os.path.exists(_hover_pkl_ws):
+            with open(_hover_pkl_ws, "rb") as _fws:
+                _hover_ws = pickle.load(_fws)
+            _hover_full = jax.tree.map(jnp.array, _hover_ws['params'])
+            _value_head_keys = {'linear', 'linear_1', 'linear_2'}  # skip: 8→128 ≠ 12→128
+            _copied = []
+            for k in _hover_full:
+                if k not in _value_head_keys and k in params:
+                    params[k] = _hover_full[k]  # (32,...) — full diverse PBT population
+                    _copied.append(k)
+            print(f"--> [WARM-START] Copied {len(_copied)} param groups from hover_params.pkl "
+                  f"(full 32-agent PBT diversity): {_copied}")
+        else:
+            print("--> [WARM-START] hover_params.pkl not found — keeping random init (expect NaN at step 0)")
+
         optimizer = optax.chain(
             optax.clip_by_global_norm(Config.MAX_GRAD_NORM),
             optax.adam(Config.LR_ACTOR)
@@ -654,7 +681,9 @@ def train():
             print(f"DEBUG: Env Target Theta: {env.target[2]:.4f}")
             print(f"DEBUG: Spawn Theta: {curr_state[0][0, 2]:.4f}")
 
-        # 1. Update Step
+        # 1. Update Step — keep a snapshot so we can roll back on NaN
+        _prev_params   = params
+        _prev_opt_state = opt_state
         params, opt_state, loss, logs, next_state, pbt_state, key_explore = update(
             params, opt_state, curr_state, pbt_state, key_explore,
             slam_pose, jnp.array(slam_surprise)
@@ -684,7 +713,9 @@ def train():
     
         # 2. Stability Checks
         if jnp.isnan(loss):
-            print(f"!!! CRITICAL: NaN detected at step {i} !!! Reseting batch.")
+            print(f"!!! CRITICAL: NaN detected at step {i} !!! Rolling back params + resetting batch.")
+            params    = _prev_params     # restore last-known-good weights
+            opt_state = _prev_opt_state  # restore last-known-good optimizer state
             rng, k_res = jax.random.split(rng)
             curr_state = env.reset(k_res, Config.BATCH_SIZE)
             continue
