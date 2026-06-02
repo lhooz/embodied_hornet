@@ -17,7 +17,7 @@ from typing import NamedTuple
 from functools import partial
 
 # --- INTEGRATION MODULES (modified for embodied_hornet) ---
-from .neural_idapbc import policy_network_icnn, hover_stable, differentiable_attention_gate, unpack_action, ScaleConfig
+from .neural_idapbc import policy_network_icnn, differentiable_attention_gate, unpack_action, ScaleConfig
 from .env import FlyEnv
 
 # --- BASE MODULES FROM hornetRL SIBLING REPO ---
@@ -384,10 +384,17 @@ def train():
                 0.0, 1.0
             )
             sim_surprise = jnp.maximum(frozen_surp, dist_floor)
-            
-            # Brain-to-muscle mapping for active IDA-PBC Hover stabilization
-            hover_mods, _ = jax.vmap(hover_stable)(noisy_obs)
-            
+
+            # Hover modulations: run the TRAINED policy with velocities zeroed out.
+            # Semantics: "what would the learned ICNN+BiologicalKinematicMap command
+            # if I want zero velocity right here?" -- this IS the hover command,
+            # using the actual trained weights inside ac_model/params.
+            hover_robot   = curr_robot.at[:, 4:8].set(0.0)      # zero vx, vz, w_theta, w_phi
+            hover_wrapped = jnp.mod(hover_robot[:, 2] + jnp.pi, 2 * jnp.pi) - jnp.pi
+            hover_obs_raw = hover_robot.at[:, 2].set(hover_wrapped)
+            hover_obs     = jnp.concatenate([symlog(hover_obs_raw), curr_weighted_belief], axis=-1)
+            hover_mods, _, _ = batched_network(params, hover_obs, jnp.zeros((B, 4)))
+
             # Fully differentiable attention gate blending
             blended_mods, alpha = jax.vmap(differentiable_attention_gate)(sim_surprise, mods, hover_mods)
             

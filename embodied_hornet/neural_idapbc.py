@@ -3,15 +3,16 @@ embodied_hornet/neural_idapbc.py
 
 Integration extensions to hornetRL's IDA-PBC controller.
 Imports all base classes from the hornetRL submodule and adds:
-  - hover_stable(): Pure JAX Lyapunov-stable hover policy (no haiku modules)
+  - hover_stable(): Parameter-free analytical fallback (emergency / hardware deploy only)
   - differentiable_attention_gate(): DNAG smooth blending based on SLAM surprise
 
-NOTE: IDA_PBC_Hover was previously an hk.Module using a random ICNN, which
-(a) required hk.transform and broke jax.vmap, and (b) provided no stability
-guarantee since the ICNN was never trained. It is replaced with an analytical
-quadratic energy controller: V(e) = 0.5*||e||^2, grad_V = e -- provably
-Lyapunov-stable. BiologicalKinematicMap (also hk.Module) is replaced with
-an equivalent fixed analytical mapping.
+NOTE ON DESIGN:
+The trained ICNN and BiologicalKinematicMap in hornetRL are the correct hover
+controllers -- they were trained to produce stable hovering behaviour. In the
+DNAG pipeline (train.py), hover_mods is computed by re-evaluating the TRAINED
+policy (ac_model.apply) on a velocity-zeroed observation, so it uses the actual
+trained weights from params. hover_stable() below is a parameter-free analytical
+backup kept for emergency / hardware-deploy scenarios where params are unavailable.
 """
 import jax
 import jax.numpy as jnp
@@ -26,33 +27,33 @@ from hornetRL.neural_idapbc import (
 )
 
 # ==============================================================================
-# SAFETY -- PURE JAX LYAPUNOV HOVERING CONTROLLER
+# ANALYTICAL FALLBACK -- PARAMETER-FREE HOVER (emergency / hardware deploy only)
 # ==============================================================================
 def hover_stable(x, target_state=None):
     """
-    Pure JAX Lyapunov-stable hover policy mapping observations to CPG modulations.
-    Invoked (via DNAG) when spatial uncertainty / SLAM Surprise is high, to
-    arrest kinetic energy and hold position.
+    Parameter-free analytical hover controller.
 
-    Replaces the previous hk.Module-based IDA_PBC_Hover + BiologicalKinematicMap
-    pair, which required hk.transform and was incompatible with bare jax.vmap.
+    NOT used in the main SHAC training loop. In train.py, hover_mods are
+    computed by re-running the TRAINED policy (batched_network / ac_model.apply)
+    with velocities zeroed out -- that uses the actual trained ICNN +
+    BiologicalKinematicMap weights from params, which is what achieves the
+    performance the user trained.
 
-    Energy shaping:
-        V(e) = 0.5 * ||e||^2  ->  grad_V = e  (quadratic, provably Lyapunov-stable)
-        (Previous ICNN had random weights and was never trained -- no stability
-        guarantee. Quadratic is a strict improvement.)
+    This function is kept as:
+      - Emergency fallback when trained params are unavailable (e.g. early in
+        hardware deployment before a checkpoint is loaded).
+      - Diagnostic baseline for comparing trained vs. analytical hover quality.
 
-    Force -> modulation mapping:
-        Fixed analytical mapping mirroring BiologicalKinematicMap output structure.
-        Ensures hover_mods stay in the same 9D space as policy_mods so DNAG
-        blending is meaningful.
+    Energy: quadratic V(e) = 0.5*||e||^2, grad_V = e (Lyapunov-stable).
+    Kinematic map: fixed analytical gains mirroring BiologicalKinematicMap
+    output structure (no learned weights).
 
     Args:
         x:            (8,) observation [x, z, theta, phi, vx, vz, w_theta, w_phi]
-        target_state: (8,) target state (default: hover at origin, theta=1.0)
+        target_state: (8,) target (default: hover at origin, theta=1.0)
 
     Returns:
-        modulations_vector: (9,) CPG modulation vector (same space as policy_mods)
+        modulations_vector: (9,) CPG modulation vector
         u_forces:           (4,) raw force command [Fx, Fz, Tau_theta, Tau_phi]
     """
     if target_state is None:
