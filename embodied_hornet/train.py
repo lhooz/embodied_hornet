@@ -131,6 +131,32 @@ def actor_critic_fn(combined_state, action_noise=None):
 ac_model = hk.without_apply_rng(hk.transform(actor_critic_fn))
 
 # ==============================================================================
+# 2b. HOVER SPECIALIST MODEL (8D — matches hover_params.pkl from hornetRL)
+# ==============================================================================
+def hover_actor_fn(physical_state, action_noise=None):
+    """
+    Original hornetRL actor architecture (8D physical state only).
+    Matches the parameter structure of hover_params.pkl — trained by hornetRL
+    exclusively for stable hovering. Used as the fixed DNAG reference.
+    NOT updated during SHAC training (hover_fixed_params is frozen).
+    """
+    target_sym = symlog(Config.TARGET_STATE)
+    mods, forces = policy_network_icnn(
+        physical_state,
+        target_state=target_sym,
+        action_noise=action_noise
+    )
+    # Critic on 8D state (matching hover_params.pkl structure)
+    value = hk.Sequential([
+        hk.Linear(128), jax.nn.tanh,
+        hk.Linear(128), jax.nn.tanh,
+        hk.Linear(1)
+    ])(physical_state)
+    return mods, forces, value
+
+hover_ac_model = hk.without_apply_rng(hk.transform(hover_actor_fn))
+
+# ==============================================================================
 # 3. VISUALIZATION ENGINE
 # ==============================================================================
 def run_visualization(env, params, update_idx, vis_step_fn):
@@ -323,6 +349,26 @@ def train():
 
     print(f"--> Initialization Complete. Params Batch Shape: {params['linear']['w'].shape}")
 
+    # --------------------------------------------------------------------------
+    # Load hover specialist (fixed reference for DNAG gate)
+    # --------------------------------------------------------------------------
+    _hover_pkl = os.path.join(os.path.dirname(__file__), "hover_params.pkl")
+    _use_hover_specialist = False
+    hover_fixed_params = None
+
+    if os.path.exists(_hover_pkl):
+        with open(_hover_pkl, "rb") as _f:
+            _hover_ckpt = pickle.load(_f)
+        hover_fixed_params = jax.tree.map(jnp.array, _hover_ckpt['params'])
+        _use_hover_specialist = True
+        print(f"--> [HOVER] Loaded hover specialist from hover_params.pkl "
+              f"(batch={hover_fixed_params['biological_kinematic_map']['~']['linear']['w'].shape[0]})")
+    else:
+        print("--> [HOVER] hover_params.pkl not found — using velocity-zeroed policy fallback.")
+
+    # Batched hover network (vmapped over 32-agent PBT population)
+    batched_hover_network = jax.vmap(hover_ac_model.apply)
+
     def loss_fn(params, start_state, pbt_weights, key, slam_pose, slam_surprise):
         """
         Computes the total loss over the trajectory horizon.
@@ -385,15 +431,21 @@ def train():
             )
             sim_surprise = jnp.maximum(frozen_surp, dist_floor)
 
-            # Hover modulations: run the TRAINED policy with velocities zeroed out.
-            # Semantics: "what would the learned ICNN+BiologicalKinematicMap command
-            # if I want zero velocity right here?" -- this IS the hover command,
-            # using the actual trained weights inside ac_model/params.
-            hover_robot   = curr_robot.at[:, 4:8].set(0.0)      # zero vx, vz, w_theta, w_phi
-            hover_wrapped = jnp.mod(hover_robot[:, 2] + jnp.pi, 2 * jnp.pi) - jnp.pi
-            hover_obs_raw = hover_robot.at[:, 2].set(hover_wrapped)
-            hover_obs     = jnp.concatenate([symlog(hover_obs_raw), curr_weighted_belief], axis=-1)
-            hover_mods, _, _ = batched_network(params, hover_obs, jnp.zeros((B, 4)))
+            # Hover modulations: dedicated hover specialist (trained ICNN + BiologicalKinematicMap).
+            # hover_fixed_params is closed over and treated as a constant by JAX JIT —
+            # it NEVER receives gradients from the SHAC loss.
+            # noisy_obs is 8D (physical state only), matching the hover specialist's obs space.
+            if _use_hover_specialist:
+                hover_mods, _, _ = batched_hover_network(
+                    hover_fixed_params, noisy_obs, jnp.zeros((B, 4))
+                )
+            else:
+                # Fallback: velocity-zeroed policy (if hover_params.pkl was not found)
+                hover_robot   = curr_robot.at[:, 4:8].set(0.0)
+                hover_wrapped = jnp.mod(hover_robot[:, 2] + jnp.pi, 2 * jnp.pi) - jnp.pi
+                hover_obs_raw = hover_robot.at[:, 2].set(hover_wrapped)
+                hover_obs     = jnp.concatenate([symlog(hover_obs_raw), curr_weighted_belief], axis=-1)
+                hover_mods, _, _ = batched_network(params, hover_obs, jnp.zeros((B, 4)))
 
             # Fully differentiable attention gate blending
             blended_mods, alpha = jax.vmap(differentiable_attention_gate)(sim_surprise, mods, hover_mods)

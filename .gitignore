@@ -20,9 +20,10 @@ dist/
 .idea/
 .vscode/
 
-# Training outputs
+# Training outputs (checkpoint PKLs excluded; hover_params is a tracked asset)
 checkpoints_shac/
 *.pkl
+!embodied_hornet/hover_params.pkl  # pre-trained hover specialist (essential asset)
 *.gif
 *.png
 *.npz
