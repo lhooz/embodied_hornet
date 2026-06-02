@@ -165,7 +165,8 @@ def run_visualization(env, params, update_idx, vis_step_fn):
     steps_per_frame = 1
     total_visual_frames = Config.HORIZON * 8
 
-    sim_data = {'states': [], 'wing_pose': [], 'nodal_forces': [], 'le_marker': [], 'hinge_marker': [], 't': []}
+    sim_data = {'states': [], 'wing_pose': [], 'nodal_forces': [], 'le_marker': [], 'hinge_marker': [], 't': [],
+                'slam_pos': []}  # also track SLAM-space position for nav panel
     
     rng = jax.random.PRNGKey(update_idx)
     state = env.reset(rng, 1) 
@@ -187,89 +188,158 @@ def run_visualization(env, params, update_idx, vis_step_fn):
             state, f_nodal, w_pose, h_marker = vis_step_fn(env, state, params_single, current_step_counter)
             current_step_counter += 1
 
-        sim_data['states'].append(np.array(state[0][0])) 
+        r_state_np = np.array(state[0][0])  # (8,) physical state of agent 0
+        sim_data['states'].append(r_state_np)
         sim_data['t'].append(current_step_counter * Config.DT)
-        
+        # Convert physical (x, z) → SLAM (u, v) for nav panel
+        _slam_scale  = env._slam_scale
+        _slam_offset = 5.0
+        slam_u = r_state_np[0] * _slam_scale + _slam_offset
+        slam_v = r_state_np[1] * _slam_scale + _slam_offset
+        sim_data['slam_pos'].append((slam_u, slam_v))
+
         f_st = state[1]
         sim_data['le_marker'].append(np.array(f_st.marker_le[0]))
         sim_data['wing_pose'].append(np.array(w_pose[0]))
         sim_data['nodal_forces'].append(np.array(f_nodal[0]))
         sim_data['hinge_marker'].append(np.array(h_marker[0]))
 
-    # --- Matplotlib Animation Setup ---
-    fig, ax = plt.subplots(figsize=(8, 8))
-    ax.set_aspect('equal')
-    
-    patch_thorax = patches.Ellipse((0,0), linewidth=1.0, width=0.012, height=0.006, facecolor='#333333', edgecolor='black', zorder=10)
-    patch_head = patches.Circle((0,0), linewidth=1.0, radius=0.0025, facecolor='#00FF00', edgecolor='black', zorder=10)
-    patch_abd = patches.Ellipse((0,0), linewidth=1.0, width=0.018, height=0.008, facecolor='#1f77b4', edgecolor='black', alpha=0.8, zorder=9)
-    ax.add_patch(patch_thorax)
-    ax.add_patch(patch_head)
-    ax.add_patch(patch_abd)
+    # -----------------------------------------------------------------------
+    # Matplotlib Animation — two-panel layout
+    # Left:  10m×10m navigation room (SLAM space) with obstacles + trajectory
+    # Right: close-up wing mechanics (as before)
+    # -----------------------------------------------------------------------
+    fig, (ax_nav, ax_wing) = plt.subplots(1, 2, figsize=(14, 7))
+    fig.patch.set_facecolor('#0d0d0d')
+    for ax in (ax_nav, ax_wing):
+        ax.set_facecolor('#111111')
+        ax.tick_params(colors='#aaaaaa')
+        for spine in ax.spines.values():
+            spine.set_edgecolor('#444444')
 
-    real_line, = ax.plot([], [], 'k-', linewidth=1.0, alpha=0.8, zorder=12)
-    patch_le = patches.Circle((0,0), radius=0.001, color='red', zorder=15)
-    ax.add_patch(patch_le)
+    # --- Left panel: navigation room ---
+    ax_nav.set_xlim(0, 10)
+    ax_nav.set_ylim(0, 10)
+    ax_nav.set_aspect('equal')
+    ax_nav.set_title('Navigation Room (SLAM Space)', color='white', fontsize=10)
+    ax_nav.set_xlabel('X (m)', color='#aaaaaa')
+    ax_nav.set_ylabel('Y (m)', color='#aaaaaa')
 
-    patch_hinge = patches.Circle((0,0), radius=0.001, color='orange', zorder=15)
-    ax.add_patch(patch_hinge)
+    # Draw room boundary
+    room_rect = plt.Rectangle((0, 0), 10, 10, linewidth=2, edgecolor='#00ffcc', facecolor='none')
+    ax_nav.add_patch(room_rect)
+
+    # Draw obstacles
+    obstacles_np = np.array(env._obstacles) if env._obstacles is not None else np.zeros((0, 4))
+    for obs in obstacles_np:
+        x0, y0, x1, y1 = obs
+        w_obs, h_obs = x1 - x0, y1 - y0
+        obs_rect = plt.Rectangle((x0, y0), w_obs, h_obs,
+                                  facecolor='#3a3a5c', edgecolor='#7777cc', linewidth=1)
+        ax_nav.add_patch(obs_rect)
+
+    # Draw target in SLAM coords
+    target_phys = np.array(Config.TARGET_STATE)
+    _slam_scale  = env._slam_scale
+    _slam_offset = 5.0
+    tgt_u = target_phys[0] * _slam_scale + _slam_offset
+    tgt_v = target_phys[1] * _slam_scale + _slam_offset
+    ax_nav.plot(tgt_u, tgt_v, marker='*', markersize=14, color='#ffdd00',
+                markeredgecolor='#ff8800', zorder=20, label='Target')
+
+    # Trajectory line and hornet dot (animated)
+    traj_line, = ax_nav.plot([], [], '-', color='#00ff88', linewidth=1.0, alpha=0.6, zorder=5)
+    hornet_dot, = ax_nav.plot([], [], 'o', color='#ff4444', markersize=7, zorder=15)
+    heading_arr = ax_nav.quiver([], [], [], [], color='#ff8888', scale=20, width=0.004, zorder=16)
+    nav_time = ax_nav.text(0.02, 0.96, '', transform=ax_nav.transAxes,
+                           color='#cccccc', fontsize=8, va='top')
+    ax_nav.legend(loc='lower right', facecolor='#222222', labelcolor='white', fontsize=8)
+
+    # --- Right panel: close-up wing mechanics (unchanged logic) ---
+    ax_wing.set_aspect('equal')
+    ax_wing.set_title('Wing Mechanics (Close-up)', color='white', fontsize=10)
+    ax_wing.set_xlabel('X (m)', color='#aaaaaa')
+    ax_wing.set_ylabel('Z (m)', color='#aaaaaa')
+    ax_wing.grid(True, linestyle=':', alpha=0.2, color='#444444')
+
+    patch_thorax = patches.Ellipse((0,0), linewidth=1.0, width=0.012, height=0.006,
+                                   facecolor='#555555', edgecolor='#aaaaaa', zorder=10)
+    patch_head   = patches.Circle((0,0), linewidth=1.0, radius=0.0025,
+                                   facecolor='#00FF88', edgecolor='#aaaaaa', zorder=10)
+    patch_abd    = patches.Ellipse((0,0), linewidth=1.0, width=0.018, height=0.008,
+                                   facecolor='#4488cc', edgecolor='#aaaaaa', alpha=0.8, zorder=9)
+    ax_wing.add_patch(patch_thorax)
+    ax_wing.add_patch(patch_head)
+    ax_wing.add_patch(patch_abd)
+
+    real_line, = ax_wing.plot([], [], '-', color='#cccccc', linewidth=1.5, alpha=0.9, zorder=12)
+    patch_le    = patches.Circle((0,0), radius=0.001, color='#ff4444', zorder=15)
+    patch_hinge = patches.Circle((0,0), radius=0.001, color='#ff8800', zorder=15)
+    ax_wing.add_patch(patch_le)
+    ax_wing.add_patch(patch_hinge)
 
     dummy = np.zeros(20)
-    quiver = ax.quiver(dummy, dummy, dummy, dummy, color='red', scale=3.0, scale_units='xy', zorder=20, width=0.0002)
-
-    time_text = ax.text(0.02, 0.95, '', transform=ax.transAxes, color='black')
-    ax.grid(True, linestyle=':', alpha=0.3)
+    quiver = ax_wing.quiver(dummy, dummy, dummy, dummy, color='#ff6666',
+                             scale=3.0, scale_units='xy', zorder=20, width=0.0002)
+    time_text = ax_wing.text(0.02, 0.95, '', transform=ax_wing.transAxes, color='#cccccc', fontsize=8)
 
     def update(frame):
         if frame >= len(sim_data['states']): return
-        
-        r_state = sim_data['states'][frame]
-        w_pose = sim_data['wing_pose'][frame]
-        f_nodal = sim_data['nodal_forces'][frame]
-        le_pos = sim_data['le_marker'][frame]
-        hinge_pos = sim_data['hinge_marker'][frame]
-        t = sim_data['t'][frame]
-        
-        rx, rz = r_state[0], r_state[1]
+
+        r_state  = sim_data['states'][frame]
+        w_pose   = sim_data['wing_pose'][frame]
+        f_nodal  = sim_data['nodal_forces'][frame]
+        le_pos   = sim_data['le_marker'][frame]
+        hinge_p  = sim_data['hinge_marker'][frame]
+        t        = sim_data['t'][frame]
+        slam_pos = sim_data['slam_pos'][:frame+1]
+
+        rx, rz   = r_state[0], r_state[1]
         r_th, r_phi = r_state[2], r_state[3]
-        
-        ax.set_xlim(-0.3, 0.3)
-        ax.set_ylim(-0.3, 0.3)
-        
+
+        # -- left panel: trajectory --
+        if slam_pos:
+            xs = [p[0] for p in slam_pos]
+            ys = [p[1] for p in slam_pos]
+            traj_line.set_data(xs, ys)
+            hornet_dot.set_data([xs[-1]], [ys[-1]])
+            heading_arr.set_offsets([[xs[-1], ys[-1]]])
+            heading_arr.set_UVC([np.cos(r_th)], [np.sin(r_th)])
+        nav_time.set_text(f'T={t:.3f}s  Rew={r_state[1]:.3f}m')
+
+        # -- right panel: wing mechanics --
+        ax_wing.set_xlim(rx - 0.06, rx + 0.06)
+        ax_wing.set_ylim(rz - 0.06, rz + 0.06)
+
         d1 = real_props.d1
         d2 = real_props.d2
-
         patch_thorax.set_center((rx, rz))
         patch_thorax.set_angle(np.degrees(r_th))
-        
         patch_head.set_center((rx + d1 * np.cos(r_th), rz + d1 * np.sin(r_th)))
-        
         joint_x = rx - d1 * np.cos(r_th)
         joint_z = rz - d1 * np.sin(r_th)
-        
         abd_ang = r_th + r_phi
         patch_abd.set_center((joint_x - d2 * np.cos(abd_ang), joint_z - d2 * np.sin(abd_ang)))
         patch_abd.set_angle(np.degrees(abd_ang))
-        
+
         wx, wz, wang = w_pose
         wing_len = env.phys.fluid.WING_LEN
-        N_pts = env.phys.fluid.N_PTS
-        x_local = np.linspace(wing_len/2, -wing_len/2, N_pts)
+        N_pts    = env.phys.fluid.N_PTS
+        x_local  = np.linspace(wing_len/2, -wing_len/2, N_pts)
         c_w, s_w = np.cos(wang), np.sin(wang)
-        wing_x = wx + x_local * c_w
-        wing_z = wz + x_local * s_w
+        wing_x   = wx + x_local * c_w
+        wing_z   = wz + x_local * s_w
         real_line.set_data(wing_x, wing_z)
-        
         patch_le.set_center((le_pos[0], le_pos[1]))
-        patch_hinge.set_center((hinge_pos[0], hinge_pos[1]))
-        
+        patch_hinge.set_center((hinge_p[0], hinge_p[1]))
         pts = np.stack([wing_x, wing_z], axis=1)
         quiver.set_offsets(pts)
         quiver.set_UVC(f_nodal[:, 0], f_nodal[:, 1])
-        
-        time_text.set_text(f"T: {t:.4f}s | Y: {rz:.3f}")
-        return patch_thorax, patch_le, patch_hinge
+        time_text.set_text(f'T={t:.4f}s | Z={rz:.3f}m')
 
+        return patch_thorax, patch_le, patch_hinge, traj_line, hornet_dot
+
+    plt.tight_layout()
     ani = animation.FuncAnimation(fig, update, frames=len(sim_data['states']), interval=20, blit=False)
     out_file = os.path.join(Config.VIS_DIR, f"epoch_{update_idx}.gif")
     ani.save(out_file, writer='pillow', fps=60)
