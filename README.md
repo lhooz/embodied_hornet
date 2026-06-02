@@ -38,14 +38,19 @@ Event Camera → [neuro-symbolic-slam] → Spatial Belief (3-DOF) + Visual Featu
 ```text
 embodied_hornet/                        <-- This repository (integration layer)
 ├── embodied_hornet/                    <-- Python integration package
-│   ├── __init__.py                     # sys.path setup for dependency resolution
-│   ├── train.py                        # Unified SHAC+PBT training loop (12-dim obs, DNAG, Instar)
-│   ├── env.py                          # FlyEnv + Asymmetric Instar perceptual routing
-│   ├── neural_idapbc.py                # IDA-PBC + hover_stable + DNAG attention gate
-│   └── snn_live_slam.py                # SLAM orchestrator + surprise telemetry
+│   ├── __init__.py                     # sys.path setup for submodule dependency resolution
+│   ├── train.py                        # Unified SHAC+PBT training loop; real SNNSLAMSystem
+│   │                                   #   integration (outside-JIT, async multi-rate)
+│   ├── env.py                          # FlyEnv: Port-Hamiltonian flight physics +
+│   │                                   #   arena generation, SLAM sensor pipeline,
+│   │                                   #   Asymmetric Instar perceptual routing
+│   ├── neural_idapbc.py                # IDA-PBC energy shaping, hover_stable(),
+│   │                                   #   differentiable attention gate (DNAG)
+│   └── snn_live_slam.py                # Thin re-export wrapper + surprise telemetry
+│                                       #   logging for DNAG diagnostics
 ├── hornetRL/                           <-- git submodule (base flight control, unmodified)
 ├── fly_surrogate/                      <-- git submodule (aerodynamic physics, unmodified)
-├── neuro-symbolic-slam/                <-- shallow clone (large binaries; see setup below)
+├── neuro-symbolic-slam/                <-- git submodule (SLAM perception, unmodified)
 ├── docs/
 │   └── system_integration_report.md   # Full architectural specification
 ├── pyproject.toml
@@ -92,10 +97,10 @@ All integration code lives in `embodied_hornet/` (this package). The three depen
 
 | Module | File | What it adds |
 |:---|:---|:---|
-| `env.py` | [embodied_hornet/env.py](embodied_hornet/env.py) | `ingest_perceptual_streams()` — Asymmetric Instar rule routing 515-dim visual belief → 4-dim CPG input |
-| `neural_idapbc.py` | [embodied_hornet/neural_idapbc.py](embodied_hornet/neural_idapbc.py) | `IDA_PBC_Hover`, `hover_stable()`, `differentiable_attention_gate()` (DNAG) |
-| `train.py` | [embodied_hornet/train.py](embodied_hornet/train.py) | Unified 12-dim observation, visual-similarity surprise signal, SHAC+PBT training loop |
-| `snn_live_slam.py` | [embodied_hornet/snn_live_slam.py](embodied_hornet/snn_live_slam.py) | Surprise telemetry logging (threshold crossings for DNAG diagnostics) |
+| `env.py` | [embodied_hornet/env.py](embodied_hornet/env.py) | `FlyEnv`: 1m×1m arena geometry generation (`regenerate_arena()`), SLAM coordinate mapping (hornet ±0.5m → 10m SLAM space), `compute_slam_sensors()` producing real event-camera + ToF + kinematic odometry for `SNNSLAMSystem`; `ingest_perceptual_streams()` Asymmetric Instar rule routing visual belief → 4-dim CPG input |
+| `neural_idapbc.py` | [embodied_hornet/neural_idapbc.py](embodied_hornet/neural_idapbc.py) | `IDA_PBC_Hover`, `hover_stable()`, `differentiable_attention_gate()` (DNAG) — blends policy with passivity-preserving hover modulations gated by real SLAM surprise |
+| `train.py` | [embodied_hornet/train.py](embodied_hornet/train.py) | Unified 12-dim observation, real `SNNSLAMSystem` integration (outside-JIT async loop), per-episode arena + SLAM reset, SHAC+PBT training loop |
+| `snn_live_slam.py` | [embodied_hornet/snn_live_slam.py](embodied_hornet/snn_live_slam.py) | Thin re-export wrapper over `neuro-symbolic-slam`'s module; adds surprise telemetry logging (threshold crossings for DNAG diagnostics) |
 
 ---
 
