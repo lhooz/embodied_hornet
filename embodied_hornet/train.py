@@ -47,7 +47,8 @@ class Config:
     TARGET_STATE = jnp.array([0.0, 0.0, 1.0, 0.2, 0.0, 0.0, 0.0, 0.0])
 
     # --- Arena Boundaries ---
-    ARENA_W = 0.45 
+    # 1m × 1m physical arena (SLAM coordinate: ±0.5m → [0.5, 9.5]m in 10m SLAM space)
+    ARENA_W = 0.5
 
     # --- Time Scales ---
     DT = 3e-5               # Physics integration timestep (s)
@@ -532,6 +533,35 @@ def train():
     slam_prev_int = np.zeros(N_PIXELS, dtype=np.float32)                  # event delta baseline
     print(f"    -> SLAM initialised at ({init_slam_x:.2f}, {init_slam_z:.2f}) m, heading {init_slam_th:.2f} rad")
     
+    # Helper: regenerate arena + reset SLAM at episode boundaries
+    def _reset_slam_for_new_arena(key, curr_agent0_state):
+        """
+        Called at forced-reset boundaries (PBT + periodic RESET_INTERVAL).
+        1. Regenerates obstacle room (new episode = new room).
+        2. Resets SNNSLAMSystem and re-initialises from agent-0's current pose.
+        3. Clears the event-camera intensity baseline.
+        Returns updated slam_pose, slam_surprise, slam_prev_int.
+        """
+        nonlocal slam_prev_int
+        env.regenerate_arena(key=key)
+
+        # Re-initialise SLAM from agent-0's current pose in the new room
+        r0 = np.array(curr_agent0_state)
+        new_slam_x  = float(r0[0]) * env._slam_scale + 5.0
+        new_slam_z  = float(r0[1]) * env._slam_scale + 5.0
+        new_slam_th = float(r0[2])
+
+        slam_system.reset(1)
+        slam_system.initialize_from_gt(
+            jnp.array([[new_slam_x, new_slam_z]]),
+            jnp.array([new_slam_th]),
+        )
+        slam_prev_int = np.zeros(N_PIXELS, dtype=np.float32)  # clear event baseline
+
+        new_slam_pose = jnp.array([new_slam_x, new_slam_z, new_slam_th])
+        print(f"    ---> New arena + SLAM reset: pose ({new_slam_x:.2f}, {new_slam_z:.2f}) m")
+        return new_slam_pose, 0.0  # fresh room → surprise starts at 0
+
     # --- JIT Compilation ---
     print("---> Compiling JAX Update...")
     t0 = time.time()
@@ -635,7 +665,7 @@ def train():
         # --- A. PBT EVOLUTION ---
         performed_pbt = False
         if i % Config.PBT_INTERVAL == 0 and i > 0:
-            print(f"--> PBT EVOLUTION (Step {i})")
+            print(f"---> PBT EVOLUTION (Step {i})")
             rng, k_pbt = jax.random.split(rng)
 
             best_idx = jnp.argmax(pbt_state.running_reward)
@@ -652,10 +682,14 @@ def train():
             )
             performed_pbt = True 
 
-        # --- B. FORCED RESET ---
+        # --- B. FORCED RESET (with arena + SLAM regeneration) ---
         if (i % Config.RESET_INTERVAL == 0 and i > 0) or performed_pbt:
             if performed_pbt:
-                print("    -> PBT Mutation applied. Forcing Environment Reset.")
+                print("    -> PBT Mutation applied. Forcing Environment + Arena Reset.")
+            rng, k_arena = jax.random.split(rng)
+            slam_pose, slam_surprise = _reset_slam_for_new_arena(
+                k_arena, curr_state[0][0]  # agent-0's state before reset
+            )
             curr_state = env.reset(rng, Config.BATCH_SIZE)
 
         print(f"Step {i:04d} | Epoch: {dt_epoch:.2f}s | Total: {total_elapsed/60:.1f}min | "

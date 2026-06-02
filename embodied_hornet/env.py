@@ -65,34 +65,50 @@ class FlyEnv:
 
         # --- Arena geometry for SLAM sensor generation ---
         # Scale factor: maps hornet ±ARENA_W metres into [0.5, 9.5] of the 10m room.
-        self._slam_scale  = _SLAM_OFFSET / getattr(config, 'ARENA_W', 0.45)
-        self._obstacles   = None  # set by _init_arena()
+        # With ARENA_W=0.5 (1m×1m arena): slam_scale = 10.0×
+        self._slam_scale  = _SLAM_OFFSET / getattr(config, 'ARENA_W', 0.5)
+        self._obstacles   = None  # set by regenerate_arena()
         self._segments    = None
         self._tex_tensor  = None
-        self._init_arena(seed=42)
+        self.regenerate_arena(seed=42, quiet=True)  # initial room
 
     # ------------------------------------------------------------------
-    def _init_arena(self, seed: int = 42):
+    def regenerate_arena(self, key=None, seed: int = None, quiet: bool = False):
         """
-        Generates a fixed 10m × 10m obstacle room (used for the entire
-        training run so that SLAM can build a persistent map).
-        Called once in __init__; safe to call again to regenerate.
+        Generates a new 10m × 10m obstacle room with fresh random obstacles
+        and barcode wall textures.
+
+        Called once at __init__ (fixed seed=42) and then at every forced
+        episode reset in train.py so each episode has a new environment
+        (the SLAM system is also reset externally when this is called).
+
+        Args:
+            key:   Optional JAX PRNGKey — used to derive seed if provided.
+            seed:  Optional int seed — used directly if key is None.
+            quiet: Suppress the print line (used on first call from __init__).
         """
+        if key is not None:
+            # Derive a deterministic int seed from a JAX key
+            seed = int(jax.random.randint(key, (), 0, 2**31 - 1))
+        elif seed is None:
+            seed = 42
+
         rng = np.random.RandomState(seed)
         k_obs = jax.random.PRNGKey(rng.randint(0, 2**31))
 
-        obstacles_jax      = generate_obstacles(k_obs)
-        segments_jax       = obstacles_to_segments(obstacles_jax)
-        obstacles_np       = np.array(obstacles_jax)
-        room_seed          = int(rng.randint(0, 2**31))
-        surface_textures   = _generate_surface_textures(obstacles_np, room_seed)
-        tex_tensor         = _precompute_barcode_tensors(surface_textures, obstacles_np)
+        obstacles_jax    = generate_obstacles(k_obs)
+        segments_jax     = obstacles_to_segments(obstacles_jax)
+        obstacles_np     = np.array(obstacles_jax)
+        room_seed        = int(rng.randint(0, 2**31))
+        surface_textures = _generate_surface_textures(obstacles_np, room_seed)
+        tex_tensor       = _precompute_barcode_tensors(surface_textures, obstacles_np)
 
         self._obstacles  = obstacles_jax
         self._segments   = segments_jax
         self._tex_tensor = tex_tensor
-        print(f"---> Arena: 10m×10m room, {len(obstacles_np)} obstacles "
-              f"(SLAM scale {self._slam_scale:.2f}×, offset {_SLAM_OFFSET:.1f}m)")
+        if not quiet:
+            print(f"---> Arena regenerated: 10m×10m, {len(obstacles_np)} obstacles "
+                  f"(scale {self._slam_scale:.1f}×, seed {seed})")
 
     def reset(self, key, batch_size):
         """
