@@ -116,9 +116,14 @@ def differentiable_attention_gate(surprise, policy_mods, hover_mods, gamma=15.0)
     At S=0.30 (threshold): alpha=0.5 (equal blend)
     At S=0.60 (high surprise): alpha~0.99 (nearly full hover)
     At S=0.10 (low surprise):  alpha~0.01 (nearly full policy)
+
+    NOTE: Called via jax.vmap(differentiable_attention_gate)(...) in train.py,
+    so `surprise` arrives as a scalar per-agent. Use expand_dims(-1) instead
+    of reshape(-1, 1): the former always adds exactly one trailing dim
+    (scalar→(1,), batch(B,)→(B,1)) while the latter gives (1,1) from a scalar.
     """
     alpha = jax.nn.sigmoid(gamma * (surprise - 0.30))
-    alpha = jnp.reshape(alpha, (-1, 1))  # (B, 1) for broadcast over action dim
+    alpha = jnp.expand_dims(alpha, axis=-1)   # scalar→(1,) or (B,)→(B,1)
 
     blended_mods = (1.0 - alpha) * policy_mods + alpha * hover_mods
 
