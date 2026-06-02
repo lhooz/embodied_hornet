@@ -125,30 +125,38 @@ class FlyEnv:
         n_nominal = int(batch_size * ratio)
         n_chaos = batch_size - n_nominal
         
-        # --- A. Nominal Group (Stable Hover Conditions) ---
+        # --- A. Nominal Group (Stable Hover Conditions, 80% of batch) ---
+        # Small perturbation around hover theta=1.0: ±0.5 rad (28°).
+        # This ensures the majority of agents start in a recoverable regime
+        # where the IDA-PBC generates reasonable corrective torques.
         k1_n, k2_n = jax.random.split(k1)
         q_pos_nom = jax.random.uniform(k1_n, (n_nominal, 2), minval=-0.15, maxval=0.15)
-        
-        theta_nom = jax.random.uniform(k2_n, (n_nominal, 1), minval=-1.3, maxval=1.3)
-        theta_nom = theta_nom + 1.0
-        
+
+        theta_nom = jax.random.uniform(k2_n, (n_nominal, 1), minval=-0.5, maxval=0.5)
+        theta_nom = theta_nom + 1.0  # → range [0.5, 1.5] rad, max error 0.5 rad from target
+
         phi_nom = jax.random.uniform(k2_n, (n_nominal, 1), minval=-0.1, maxval=0.1)
         phi_nom = phi_nom + 0.2
-        
+
         q_ang_nom = jnp.concatenate([theta_nom, phi_nom], axis=-1)
-        
-        # --- B. Chaos Group (Recovery Training) ---
+
+        # --- B. Chaos Group (Recovery Training, 20% of batch) ---
+        # Moderate tilt: ±π/2 (90°). Max theta error from 1.0 = 1.57 rad.
+        # Original ±π allowed up to 3.14 rad error → AVel = 1000+ rad/s at
+        # step 0 because the IDA-PBC saturates and applies maximum torque
+        # continuously, causing rapid spin rather than controlled correction.
         k1_c, k2_c = jax.random.split(k2)
         k_theta, k_phi = jax.random.split(k2_c)
         q_pos_chaos = jax.random.uniform(k1_c, (n_chaos, 2), minval=-0.25, maxval=0.25)
-        
-        theta_chaos = jax.random.uniform(k_theta, (n_chaos, 1), minval=-jnp.pi, maxval=jnp.pi)
-        theta_chaos = theta_chaos + 1.0
-        
+
+        theta_chaos = jax.random.uniform(k_theta, (n_chaos, 1), minval=-jnp.pi/2, maxval=jnp.pi/2)
+        theta_chaos = theta_chaos + 1.0  # → range [-0.57, 2.57] rad, max error 1.57 rad
+
         phi_chaos = jax.random.uniform(k_phi, (n_chaos, 1), minval=-0.5, maxval=0.5)
         phi_chaos = phi_chaos + 0.2
-        
+
         q_ang_chaos = jnp.concatenate([theta_chaos, phi_chaos], axis=-1)
+
         
         # --- C. Combine & Velocity ---
         q_pos_ordered = jnp.concatenate([q_pos_nom, q_pos_chaos], axis=0)
