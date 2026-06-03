@@ -76,6 +76,12 @@ Click the badge to open the demo notebook. It will:
 4. Launch GPU-accelerated SHAC navigation training
 5. Display epoch GIFs with the SLAM sensor overlay (ToF beams, FOV cone, collision indicators)
 
+> ⚠️ **Troubleshooting:** If you encounter `ModuleNotFoundError: No module named 'sparse_forest'` or other import errors during Cell 2 verification after cloning or pulling updates:
+> 1. Run **Cell 1** to ensure submodules are fully checked out.
+> 2. Select **Runtime → Restart runtime** from the top menu to clear the Python kernel import caches.
+> 3. Rerun all cells.
+
+
 ### Local Setup
 
 #### 1. Clone with submodules
