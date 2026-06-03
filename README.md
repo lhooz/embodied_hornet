@@ -100,10 +100,10 @@ cd embodied_hornet
 
 ```bash
 pip install -e .
-pip install -e hornetRL
-pip install -e fly_surrogate
-pip install -e neuro-symbolic-slam
 ```
+
+> **Note:** There is no need to run `pip install -e` on the individual submodules. The `embodied_hornet` integration package automatically registers all submodule paths (such as `neuro-symbolic-slam/src`) in `sys.path` at runtime.
+
 
 #### 3. Run training
 
