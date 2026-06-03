@@ -29,7 +29,7 @@ from hornetRL.pbt_manager import init_pbt_state, pbt_evolve
 # --- SLAM SYSTEM FROM neuro-symbolic-slam SUBMODULE ---
 # (sys.path for src/ is configured in embodied_hornet/__init__.py)
 from snn_slam_system import SNNSLAMSystem, N_DEPTH
-from sparse_forest import N_PIXELS
+from sparse_forest import N_PIXELS, compute_tof_distance
 
 # ==============================================================================
 # 1. CONFIGURATION
@@ -88,9 +88,13 @@ class Config:
 
     CKPT_DIR = "checkpoints_shac"
     VIS_DIR = "checkpoints_shac"
-    AUX_LOSS_WEIGHT = 1.0 
-    VIS_INTERVAL = 200      
-    
+    AUX_LOSS_WEIGHT = 1.0
+    VIS_INTERVAL = 200
+
+    # --- Obstacle Collision ---
+    OBS_PENALTY_WEIGHT = 50.0   # reward penalty per SLAM unit of penetration
+    OBS_SAFETY_SLAM    = 0.5    # safety buffer in SLAM units (≈5 cm physical)
+
     WARMUP_STEPS = 1        
 
     FORCE_NORMALIZER = ScaleConfig.CONTROL_SCALE
@@ -168,8 +172,13 @@ def run_visualization(env, params, update_idx, vis_step_fn):
     steps_per_frame = 1
     total_visual_frames = Config.HORIZON * 8
 
-    sim_data = {'states': [], 'wing_pose': [], 'nodal_forces': [], 'le_marker': [], 'hinge_marker': [], 't': [],
-                'slam_pos': []}  # also track SLAM-space position for nav panel
+    sim_data = {
+        'states': [], 'wing_pose': [], 'nodal_forces': [],
+        'le_marker': [], 'hinge_marker': [], 't': [],
+        'slam_pos': [],   # true physical position in SLAM space
+        'tof': [],        # (3,) ToF distances per frame (SLAM metres)
+        'heading': [],    # theta (rad) per frame
+    }
     
     rng = jax.random.PRNGKey(update_idx)
     state = env.reset(rng, 1) 
@@ -200,6 +209,12 @@ def run_visualization(env, params, update_idx, vis_step_fn):
         slam_u = r_state_np[0] * _slam_scale + _slam_offset
         slam_v = r_state_np[1] * _slam_scale + _slam_offset
         sim_data['slam_pos'].append((slam_u, slam_v))
+        # ToF: 3 beam distances from current SLAM position + heading
+        _tof_jax = compute_tof_distance(
+            jnp.array([slam_u, slam_v]), float(r_state_np[2]), env._segments
+        )
+        sim_data['tof'].append(np.array(_tof_jax))
+        sim_data['heading'].append(float(r_state_np[2]))
 
         f_st = state[1]
         sim_data['le_marker'].append(np.array(f_st.marker_le[0]))
@@ -232,14 +247,15 @@ def run_visualization(env, params, update_idx, vis_step_fn):
     room_rect = plt.Rectangle((0, 0), 10, 10, linewidth=2, edgecolor='#00ffcc', facecolor='none')
     ax_nav.add_patch(room_rect)
 
-    # Draw obstacles
+    # --- Draw obstacles as dynamic patches (re-colored on collision) ---
     obstacles_np = np.array(env._obstacles) if env._obstacles is not None else np.zeros((0, 4))
+    obs_patch_list = []  # list of (obs_bbox, patch) for collision highlighting
     for obs in obstacles_np:
         x0, y0, x1, y1 = obs
-        w_obs, h_obs = x1 - x0, y1 - y0
-        obs_rect = plt.Rectangle((x0, y0), w_obs, h_obs,
-                                  facecolor='#3a3a5c', edgecolor='#7777cc', linewidth=1)
-        ax_nav.add_patch(obs_rect)
+        p = plt.Rectangle((x0, y0), x1 - x0, y1 - y0,
+                           facecolor='#2a2a4c', edgecolor='#6666bb', linewidth=1, zorder=4)
+        ax_nav.add_patch(p)
+        obs_patch_list.append((obs, p))
 
     # Draw target in SLAM coords
     target_phys = np.array(Config.TARGET_STATE)
@@ -250,12 +266,25 @@ def run_visualization(env, params, update_idx, vis_step_fn):
     ax_nav.plot(tgt_u, tgt_v, marker='*', markersize=14, color='#ffdd00',
                 markeredgecolor='#ff8800', zorder=20, label='Target')
 
-    # Trajectory line and hornet dot (animated)
+    # --- Trajectory + hornet + heading arrow (animated) ---
     traj_line, = ax_nav.plot([], [], '-', color='#00ff88', linewidth=1.0, alpha=0.6, zorder=5)
     hornet_dot, = ax_nav.plot([], [], 'o', color='#ff4444', markersize=7, zorder=15)
     heading_arr = ax_nav.quiver([], [], [], [], color='#ff8888', scale=20, width=0.004, zorder=16)
+
+    # --- 3 ToF beam artists: [left, center, right] ---
+    _beam_colours = ['#00aaff', '#ffff44', '#00aaff']
+    tof_beam_artists = []
+    for _bc in _beam_colours:
+        _bl, = ax_nav.plot([], [], '-',  color=_bc, linewidth=1.5, alpha=0.85, zorder=12)
+        _bm, = ax_nav.plot([], [], 'D',  color=_bc, markersize=4,  alpha=0.95, zorder=13)
+        tof_beam_artists.append((_bl, _bm))
+
+    # --- Camera FOV boundary dashes ---
+    fov_left_line,  = ax_nav.plot([], [], '--', color='#ffff88', linewidth=0.8, alpha=0.4, zorder=3)
+    fov_right_line, = ax_nav.plot([], [], '--', color='#ffff88', linewidth=0.8, alpha=0.4, zorder=3)
+
     nav_time = ax_nav.text(0.02, 0.96, '', transform=ax_nav.transAxes,
-                           color='#cccccc', fontsize=8, va='top')
+                           color='#cccccc', fontsize=8, va='top', family='monospace')
     ax_nav.legend(loc='lower right', facecolor='#222222', labelcolor='white', fontsize=8)
 
     # --- Right panel: close-up wing mechanics (unchanged logic) ---
@@ -300,7 +329,7 @@ def run_visualization(env, params, update_idx, vis_step_fn):
         rx, rz   = r_state[0], r_state[1]
         r_th, r_phi = r_state[2], r_state[3]
 
-        # -- left panel: trajectory --
+        # -- left panel: SLAM nav view --
         if slam_pos:
             xs = [p[0] for p in slam_pos]
             ys = [p[1] for p in slam_pos]
@@ -308,7 +337,44 @@ def run_visualization(env, params, update_idx, vis_step_fn):
             hornet_dot.set_data([xs[-1]], [ys[-1]])
             heading_arr.set_offsets([[xs[-1], ys[-1]]])
             heading_arr.set_UVC([np.cos(r_th)], [np.sin(r_th)])
-        nav_time.set_text(f'T={t:.3f}s  Rew={r_state[1]:.3f}m')
+
+            # === SLAM sensor layer ===
+            if frame < len(sim_data['tof']):
+                tof_d = sim_data['tof'][frame]      # (3,) SLAM distances
+                hdg   = sim_data['heading'][frame]  # theta (rad)
+                cu, cv = xs[-1], ys[-1]
+
+                # 3 ToF beams: left/center/right at ±45° from heading
+                for bi, ((bl, bm), offset) in enumerate(
+                        zip(tof_beam_artists, [-np.pi/4, 0.0, np.pi/4])):
+                    ang = hdg + offset
+                    hu  = cu + tof_d[bi] * np.cos(ang)
+                    hv  = cv + tof_d[bi] * np.sin(ang)
+                    bl.set_data([cu, hu], [cv, hv])
+                    bm.set_data([hu], [hv])
+
+                # FOV boundary (90° camera cone)
+                fov_r = 6.0  # display range (SLAM m)
+                fov_left_line.set_data(
+                    [cu, cu + fov_r * np.cos(hdg - np.pi/4)],
+                    [cv, cv + fov_r * np.sin(hdg - np.pi/4)])
+                fov_right_line.set_data(
+                    [cu, cu + fov_r * np.cos(hdg + np.pi/4)],
+                    [cv, cv + fov_r * np.sin(hdg + np.pi/4)])
+
+                # Obstacle collision highlighting
+                for obs_bbox, op in obs_patch_list:
+                    x0, y0, x1, y1 = obs_bbox
+                    inside = (x0 <= cu <= x1) and (y0 <= cv <= y1)
+                    op.set_facecolor('#cc1111' if inside else '#2a2a4c')
+                    op.set_edgecolor('#ff3333' if inside else '#6666bb')
+
+                # SLAM text overlay
+                nav_time.set_text(
+                    f'θ={hdg:.2f}r | ToF [{tof_d[0]:.1f}\u2502{tof_d[1]:.1f}\u2502{tof_d[2]:.1f}]m'
+                )
+            else:
+                nav_time.set_text(f'T={t:.3f}s')
 
         # -- right panel: wing mechanics --
         ax_wing.set_xlim(rx - 0.06, rx + 0.06)
@@ -494,7 +560,7 @@ def train():
             _use_hover_specialist = False
             hover_fixed_params    = None
 
-    def loss_fn(params, start_state, pbt_weights, key, slam_pose, slam_surprise):
+    def loss_fn(params, start_state, pbt_weights, key, slam_pose, slam_surprise, obstacles):
         """
         Computes the total loss over the trajectory horizon.
         Includes policy gradient, value function loss, and auxiliary force matching loss.
@@ -602,14 +668,46 @@ def train():
             
             # 5. Reward Calculation
             rew_scaled, met = env.get_reward_metrics(curr_robot, u_brain, pbt_weights)
-            
+
+            # --- OBSTACLE COLLISION PENALTY (differentiable gradient signal) ---
+            # Convert physical (x, z) → SLAM space and compute signed distance to obstacles.
+            # Positive = outside all obstacles, Negative = penetrating (inside).
+            _slam_sc  = env._slam_scale
+            _slam_off = 5.0
+            cur_su = curr_robot[:, 0] * _slam_sc + _slam_off  # (B,) SLAM x
+            cur_sz = curr_robot[:, 1] * _slam_sc + _slam_off  # (B,) SLAM z
+
+            def _signed_dist(sx, sz):
+                """Minimum signed distance from point to any obstacle rectangle.
+                Positive = outside all obstacles; Negative = penetrating."""
+                def _one_obs(obs):
+                    x0, y0, x1, y1 = obs[0], obs[1], obs[2], obs[3]
+                    is_inside = (sx >= x0) & (sx <= x1) & (sz >= y0) & (sz <= y1)
+                    # Penetration depth (negative signed distance when inside)
+                    depth = -jnp.minimum(
+                        jnp.minimum(sx - x0, x1 - sx),
+                        jnp.minimum(sz - y0, y1 - sz)
+                    )
+                    # Euclidean distance to nearest rectangle point when outside
+                    cx = jnp.clip(sx, x0, x1)
+                    cy = jnp.clip(sz, y0, y1)
+                    outside = jnp.sqrt((sx - cx)**2 + (sz - cy)**2 + 1e-8)
+                    return jnp.where(is_inside, depth, outside)
+                dists = jax.vmap(_one_obs)(obstacles)  # (N_OBS,)
+                return jnp.min(dists)
+
+            min_obs_dists = jax.vmap(_signed_dist)(cur_su, cur_sz)  # (B,)
+            # Penalty: activated inside safety margin (0.5 SLAM units ≈5 cm physical)
+            obs_violation = jax.nn.relu(Config.OBS_SAFETY_SLAM - min_obs_dists)  # (B,)
+            obs_penalty   = -Config.OBS_PENALTY_WEIGHT * obs_violation           # (B,)
+
             # --- SCALE Force ---
             raw_diff = u_brain[:, :3] - f_actual[:, :3]
             norm_diff = raw_diff / Config.FORCE_NORMALIZER[:3]
             force_err_norm = jnp.mean(jnp.square(symlog(norm_diff)))
             
             # Apply Loss Weight
-            loss_t = -rew_scaled + (Config.AUX_LOSS_WEIGHT * force_err_norm)
+            loss_t = -rew_scaled + obs_penalty + (Config.AUX_LOSS_WEIGHT * force_err_norm)
             force_err_raw = jnp.mean(raw_diff**2)
             
             step_metrics = (
@@ -680,11 +778,11 @@ def train():
     _SLAM_OFFSET_TRAIN = 5.0
 
     @jax.jit
-    def update(params, opt_state, full_state, pbt_state, key, slam_pose, slam_surprise):
+    def update(params, opt_state, full_state, pbt_state, key, slam_pose, slam_surprise, obstacles):
         key_loss, key_next = jax.random.split(key)
         
         (loss, (logs, next_state)), grads = jax.value_and_grad(loss_fn, has_aux=True)(
-            params, full_state, pbt_state.weights, key_loss, slam_pose, slam_surprise
+            params, full_state, pbt_state.weights, key_loss, slam_pose, slam_surprise, obstacles
         )
         
         updates, new_opt = optimizer.update(grads, opt_state, params)
@@ -757,7 +855,7 @@ def train():
     print("---> Compiling JAX Update...")
     t0 = time.time()
     key_compile = jax.random.PRNGKey(0)
-    _ = update(params, opt_state, curr_state, pbt_state, key_compile, slam_pose, jnp.array(slam_surprise))
+    _ = update(params, opt_state, curr_state, pbt_state, key_compile, slam_pose, jnp.array(slam_surprise), env._obstacles)
     print(f"---> Compilation Finished in {time.time() - t0:.2f}s")
 
     # --- Main Loop ---
@@ -776,7 +874,7 @@ def train():
         _prev_opt_state = opt_state
         params, opt_state, loss, logs, next_state, pbt_state, key_explore = update(
             params, opt_state, curr_state, pbt_state, key_explore,
-            slam_pose, jnp.array(slam_surprise)
+            slam_pose, jnp.array(slam_surprise), env._obstacles
         )
 
         # 1b. SLAM update (outside JIT, runs on agent-0's terminal state)
@@ -814,7 +912,20 @@ def train():
         
         # --- Environment Reset Logic ---
         is_nan = jnp.isnan(r_state).any(axis=1)
-        is_crashed = (jnp.abs(r_state[:, 0]) > Config.ARENA_W) | (jnp.abs(r_state[:, 1]) > Config.ARENA_W)
+        is_oor = (jnp.abs(r_state[:, 0]) > Config.ARENA_W) | (jnp.abs(r_state[:, 1]) > Config.ARENA_W)
+        # Obstacle collision: check in SLAM space using numpy (fast, outside JIT)
+        _obs_np     = np.array(env._obstacles) if env._obstacles is not None else np.zeros((0, 4))
+        _slam_xs_np = np.array(r_state[:, 0]) * float(env._slam_scale) + 5.0
+        _slam_zs_np = np.array(r_state[:, 1]) * float(env._slam_scale) + 5.0
+        def _in_any_obs(sx, sz):
+            if len(_obs_np) == 0: return False
+            return bool(np.any(
+                (_obs_np[:, 0] <= sx) & (_obs_np[:, 2] >= sx) &
+                (_obs_np[:, 1] <= sz) & (_obs_np[:, 3] >= sz)
+            ))
+        is_in_obs = jnp.array([_in_any_obs(sx, sz)
+                                for sx, sz in zip(_slam_xs_np, _slam_zs_np)])
+        is_crashed = is_oor | is_in_obs
         reset_mask = is_nan | is_crashed
     
         rng, k_res = jax.random.split(rng)
