@@ -37,7 +37,10 @@ for _sub, _sib in zip(_submodule_paths, _sibling_paths):
     _chosen = _sub if os.path.isdir(_sub) else _sib
     if _chosen not in sys.path:
         sys.path.insert(0, _chosen)
+    # Clear any stale directory listing cached in path_importer_cache
+    sys.path_importer_cache.pop(_chosen, None)
 
 # Invalidate cached module lookups so newly-added paths take effect
 # even if a previous import attempt failed (e.g. during pip install).
+sys.path_importer_cache.clear()
 importlib.invalidate_caches()

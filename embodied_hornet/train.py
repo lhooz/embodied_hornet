@@ -1,5 +1,13 @@
 import os
-os.environ["JAX_PLATFORMS"] = "cpu"
+import sys
+import platform
+# On Darwin Arm64 (macOS Apple Silicon), force CPU as Metal is unsupported.
+# Otherwise, force CPU unless --gpu is passed.
+if platform.system() == "Darwin" and platform.machine() == "arm64":
+    os.environ["JAX_PLATFORMS"] = "cpu"
+elif "--gpu" not in sys.argv:
+    os.environ["JAX_PLATFORMS"] = "cpu"
+
 import time
 
 import jax
