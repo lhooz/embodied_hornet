@@ -2,6 +2,8 @@
 
 **Unified Spiking SLAM & Neuromechanical Flight Control System**
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/lhooz/embodied_hornet/blob/main/notebooks/demo_colab.ipynb)
+
 This project integrates three independent subsystems into a single JAX-accelerated pipeline for autonomous insect-scale flight with neuromorphic spatial intelligence.
 
 ---
@@ -51,6 +53,8 @@ embodied_hornet/                        <-- This repository (integration layer)
 ├── hornetRL/                           <-- git submodule (base flight control, unmodified)
 ├── fly_surrogate/                      <-- git submodule (aerodynamic physics, unmodified)
 ├── neuro-symbolic-slam/                <-- git submodule (SLAM perception, unmodified)
+├── notebooks/
+│   └── demo_colab.ipynb               # Google Colab demo (see badge above)
 ├── docs/
 │   └── system_integration_report.md   # Full architectural specification
 ├── pyproject.toml
@@ -59,9 +63,22 @@ embodied_hornet/                        <-- This repository (integration layer)
 
 ---
 
-## 🚀 Setup
+## 🚀 Quick Start
 
-### 1. Clone with submodules
+### Run on Google Colab (recommended)
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/lhooz/embodied_hornet/blob/main/notebooks/demo_colab.ipynb)
+
+Click the badge to open the demo notebook. It will:
+1. Mount your Drive for persistent checkpoints
+2. Clone the repo with all submodules in one command
+3. Skip hover-specialist training (pre-trained `hover_params.pkl` is included)
+4. Launch GPU-accelerated SHAC navigation training
+5. Display epoch GIFs with the SLAM sensor overlay (ToF beams, FOV cone, collision indicators)
+
+### Local Setup
+
+#### 1. Clone with submodules
 
 ```bash
 git clone --recursive https://github.com/lhooz/embodied_hornet.git
@@ -70,23 +87,26 @@ cd embodied_hornet
 
 > **Note:** The `neuro-symbolic-slam` submodule contains large binary files. If the clone stalls, run:
 > ```bash
-> git submodule update --init --reference /path/to/local/neuro-symbolic-slam neuro-symbolic-slam
-> # or shallow:
 > git submodule update --init --depth 1 neuro-symbolic-slam
 > ```
 
-### 2. Install dependencies
+#### 2. Install dependencies
 
 ```bash
 pip install -e .
-# or use the shared workspace venv:
-# source ../.venv/bin/activate
+pip install -e hornetRL
+pip install -e fly_surrogate
+pip install -e neuro-symbolic-slam
 ```
 
-### 3. Run training
+#### 3. Run training
 
 ```bash
-JAX_PLATFORMS=cpu python -m embodied_hornet.train
+# CPU (Apple Silicon / no GPU)
+python -m embodied_hornet.train
+
+# GPU (CUDA)
+python -m embodied_hornet.train --gpu
 ```
 
 ---
