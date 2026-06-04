@@ -184,8 +184,10 @@ def run_visualization(env, params, update_idx, vis_step_fn):
         'states': [], 'wing_pose': [], 'nodal_forces': [],
         'le_marker': [], 'hinge_marker': [], 't': [],
         'slam_pos': [],   # true physical position in SLAM space
+        'slam_est': [],   # SLAM estimated position (world belief)
+        'surprise': [],   # SLAM surprise metric
         'tof': [],        # (3,) ToF distances per frame (SLAM metres)
-        'heading': [],    # theta (rad) per frame
+        'heading': [],    # sensor heading (rad) per frame
     }
     
     rng = jax.random.PRNGKey(update_idx)
@@ -194,6 +196,23 @@ def run_visualization(env, params, update_idx, vis_step_fn):
     active_props_batch = state[3] 
     real_props = jax.tree.map(lambda x: x[0], active_props_batch)
     params_single = jax.tree.map(lambda x: x[0], params)
+
+    # Initialize a clean SLAM system for tracking in visualization
+    from snn_slam_system import SNNSLAMSystem
+    vis_slam = SNNSLAMSystem(jax.random.PRNGKey(update_idx + 999), n_depth=N_DEPTH)
+    vis_slam.reset(1)
+    
+    r_state_np_start = np.array(state[0][0])
+    start_slam_x = float(r_state_np_start[0]) * env._slam_scale + 5.0
+    start_slam_z = float(r_state_np_start[1]) * env._slam_scale + 5.0
+    start_slam_th = float(r_state_np_start[2]) - 1.0  # sensor heading
+    vis_slam.initialize_from_gt(
+        jnp.array([[start_slam_x, start_slam_z]]),
+        jnp.array([start_slam_th]),
+    )
+    
+    slam_surprise = 0.0
+    slam_prev_int = np.zeros(N_PIXELS, dtype=np.float32)
 
     current_step_counter = 0
 
@@ -217,12 +236,38 @@ def run_visualization(env, params, update_idx, vis_step_fn):
         slam_u = r_state_np[0] * _slam_scale + _slam_offset
         slam_v = r_state_np[1] * _slam_scale + _slam_offset
         sim_data['slam_pos'].append((slam_u, slam_v))
-        # ToF: 3 beam distances from current SLAM position + heading
+        
+        # Camera/sensor heading is body pitch - 1.0 rad (facing forward)
+        sensor_heading = float(r_state_np[2]) - 1.0
+        
+        # ToF: 3 beam distances from current SLAM position + sensor heading
         _tof_jax = compute_tof_distance(
-            jnp.array([slam_u, slam_v]), float(r_state_np[2]), env._segments
+            jnp.array([slam_u, slam_v]), sensor_heading, env._segments
         )
         sim_data['tof'].append(np.array(_tof_jax))
-        sim_data['heading'].append(float(r_state_np[2]))
+        sim_data['heading'].append(sensor_heading)
+
+        # SLAM tracking for visualization
+        ev_jax, kin_jax, tof_jax, slam_prev_int = env.compute_slam_sensors(
+            r_state_np, slam_prev_int
+        )
+        try:
+            pose_est, _, _, _, _, debug_gates = vis_slam.forward_step(
+                ev_jax, kin_jax, tof_jax,
+                inject_drift=False, autopilot_on=(slam_surprise < 0.60)
+            )
+            slam_est_u = float(pose_est[0, 0])
+            slam_est_v = float(pose_est[0, 1])
+            slam_est_th = float(pose_est[0, 2])
+            slam_surprise = float(1.0 - float(debug_gates['Raw_Match'][0]))
+        except Exception as _slam_err:
+            slam_est_u = sim_data['slam_est'][-1][0] if sim_data['slam_est'] else slam_u
+            slam_est_v = sim_data['slam_est'][-1][1] if sim_data['slam_est'] else slam_v
+            slam_est_th = sim_data['slam_est'][-1][2] if sim_data['slam_est'] else sensor_heading
+            slam_surprise = 0.0
+
+        sim_data['slam_est'].append((slam_est_u, slam_est_v, slam_est_th))
+        sim_data['surprise'].append(slam_surprise)
 
         f_st = state[1]
         sim_data['le_marker'].append(np.array(f_st.marker_le[0]))
@@ -275,8 +320,10 @@ def run_visualization(env, params, update_idx, vis_step_fn):
                 markeredgecolor='#ff8800', zorder=20, label='Target')
 
     # --- Trajectory + hornet + heading arrow (animated) ---
-    traj_line, = ax_nav.plot([], [], '-', color='#00ff88', linewidth=1.0, alpha=0.6, zorder=5)
-    hornet_dot, = ax_nav.plot([], [], 'o', color='#ff4444', markersize=7, zorder=15)
+    traj_line, = ax_nav.plot([], [], '-', color='#00ff88', linewidth=1.0, alpha=0.6, zorder=5, label='Path (GT)')
+    hornet_dot, = ax_nav.plot([], [], 'o', color='#ff4444', markersize=7, zorder=15, label='Hornet (GT)')
+    slam_est_line, = ax_nav.plot([], [], ':', color='#ffa500', linewidth=1.2, alpha=0.8, zorder=6, label='Path (SLAM)')
+    slam_est_dot, = ax_nav.plot([], [], 's', color='#ffa500', markersize=5, zorder=14, label='SLAM Pose')
     heading_arr = ax_nav.quiver([], [], [], [], color='#ff8888', scale=20, width=0.004, zorder=16)
 
     # --- 3 ToF beam artists: [left, center, right] ---
@@ -343,6 +390,15 @@ def run_visualization(env, params, update_idx, vis_step_fn):
             ys = [p[1] for p in slam_pos]
             traj_line.set_data(xs, ys)
             hornet_dot.set_data([xs[-1]], [ys[-1]])
+            
+            # SLAM estimated path and pose dot (world belief)
+            if frame < len(sim_data['slam_est']):
+                est_pts = sim_data['slam_est']
+                est_xs = [p[0] for p in est_pts[:frame+1]]
+                est_ys = [p[1] for p in est_pts[:frame+1]]
+                slam_est_line.set_data(est_xs, est_ys)
+                slam_est_dot.set_data([est_xs[-1]], [est_ys[-1]])
+
             heading_arr.set_offsets([[xs[-1], ys[-1]]])
             heading_arr.set_UVC([np.cos(r_th)], [np.sin(r_th)])
 
@@ -378,8 +434,9 @@ def run_visualization(env, params, update_idx, vis_step_fn):
                     op.set_edgecolor('#ff3333' if inside else '#6666bb')
 
                 # SLAM text overlay
+                surprise_val = sim_data['surprise'][frame] if frame < len(sim_data['surprise']) else 0.0
                 nav_time.set_text(
-                    f'θ={hdg:.2f}r | ToF [{tof_d[0]:.1f}\u2502{tof_d[1]:.1f}\u2502{tof_d[2]:.1f}]m'
+                    f'θ={hdg:.2f}r | ToF [{tof_d[0]:.1f}│{tof_d[1]:.1f}│{tof_d[2]:.1f}]m | Surprise={surprise_val:.2f}'
                 )
             else:
                 nav_time.set_text(f'T={t:.3f}s')
@@ -818,7 +875,7 @@ def train():
     init_robot0  = np.array(curr_state[0][0])            # (8,) hornet state
     init_slam_x  = float(init_robot0[0]) * env._slam_scale + 5.0
     init_slam_z  = float(init_robot0[1]) * env._slam_scale + 5.0
-    init_slam_th = float(init_robot0[2])
+    init_slam_th = float(init_robot0[2]) - 1.0  # sensor heading (facing forward)
     slam_system.initialize_from_gt(
         jnp.array([[init_slam_x, init_slam_z]]),
         jnp.array([init_slam_th]),
@@ -828,7 +885,7 @@ def train():
     slam_pose     = jnp.array([init_slam_x, init_slam_z, init_slam_th])  # (3,)
     slam_surprise = 0.0                                                    # float
     slam_prev_int = np.zeros(N_PIXELS, dtype=np.float32)                  # event delta baseline
-    print(f"    -> SLAM initialised at ({init_slam_x:.2f}, {init_slam_z:.2f}) m, heading {init_slam_th:.2f} rad")
+    print(f"    -> SLAM initialised at ({init_slam_x:.2f}, {init_slam_z:.2f}) m, sensor heading {init_slam_th:.2f} rad")
     
     # Helper: regenerate arena + reset SLAM at episode boundaries
     def _reset_slam_for_new_arena(key, curr_agent0_state):
@@ -846,7 +903,7 @@ def train():
         r0 = np.array(curr_agent0_state)
         new_slam_x  = float(r0[0]) * env._slam_scale + 5.0
         new_slam_z  = float(r0[1]) * env._slam_scale + 5.0
-        new_slam_th = float(r0[2])
+        new_slam_th = float(r0[2]) - 1.0  # sensor heading (facing forward)
 
         slam_system.reset(1)
         slam_system.initialize_from_gt(
@@ -856,7 +913,7 @@ def train():
         slam_prev_int = np.zeros(N_PIXELS, dtype=np.float32)  # clear event baseline
 
         new_slam_pose = jnp.array([new_slam_x, new_slam_z, new_slam_th])
-        print(f"    ---> New arena + SLAM reset: pose ({new_slam_x:.2f}, {new_slam_z:.2f}) m")
+        print(f"    ---> New arena + SLAM reset: pose ({new_slam_x:.2f}, {new_slam_z:.2f}) m, sensor heading {new_slam_th:.2f} rad")
         return new_slam_pose, 0.0  # fresh room → surprise starts at 0
 
     # --- JIT Compilation ---

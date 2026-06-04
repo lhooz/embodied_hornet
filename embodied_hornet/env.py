@@ -480,10 +480,14 @@ class FlyEnv:
             float(robot_state_single[1]) * self._slam_scale + _SLAM_OFFSET,
         ])
         heading = float(robot_state_single[2])
+        # Camera and ToF sensors are mounted facing forward.
+        # Since the nominal hover pitch of the hornet is 1.0 rad (tilted back/upright),
+        # we subtract 1.0 rad from the body pitch to get the forward-facing camera/sensor angle.
+        sensor_heading = heading - 1.0
 
         # 2. Event camera (256 pixels, 90° FOV)
         intensities_jax, _, _, _ = compute_pixel_readings(
-            slam_pos, heading, self._segments,
+            slam_pos, sensor_heading, self._segments,
             obstacles=self._obstacles, tex_tensor=self._tex_tensor,
         )
         intensities = np.array(intensities_jax)
@@ -492,7 +496,7 @@ class FlyEnv:
                       np.where(delta < -THRESHOLD, -1.0, 0.0)).astype(np.float32)
 
         # 3. ToF (3-beam, values in SLAM metres; SLAM handles range internally)
-        tof_jax = compute_tof_distance(slam_pos, heading, self._segments)
+        tof_jax = compute_tof_distance(slam_pos, sensor_heading, self._segments)
 
         # 4. Kinematic odometry [vx, vz, w_theta] (physical hornet units — m/s, rad/s)
         kin = np.array(robot_state_single[4:7], dtype=np.float32)
