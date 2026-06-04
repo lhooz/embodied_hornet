@@ -188,6 +188,7 @@ def run_visualization(env, params, update_idx, vis_step_fn):
         'surprise': [],   # SLAM surprise metric
         'tof': [],        # (3,) ToF distances per frame (SLAM metres)
         'heading': [],    # sensor heading (rad) per frame
+        'events': [],     # (256,) 1D event camera frames
     }
     
     rng = jax.random.PRNGKey(update_idx)
@@ -268,6 +269,7 @@ def run_visualization(env, params, update_idx, vis_step_fn):
 
         sim_data['slam_est'].append((slam_est_u, slam_est_v, slam_est_th))
         sim_data['surprise'].append(slam_surprise)
+        sim_data['events'].append(np.array(ev_jax[0]))
 
         f_st = state[1]
         sim_data['le_marker'].append(np.array(f_st.marker_le[0]))
@@ -338,9 +340,22 @@ def run_visualization(env, params, update_idx, vis_step_fn):
     fov_left_line,  = ax_nav.plot([], [], '--', color='#ffff88', linewidth=0.8, alpha=0.4, zorder=3)
     fov_right_line, = ax_nav.plot([], [], '--', color='#ffff88', linewidth=0.8, alpha=0.4, zorder=3)
 
-    nav_time = ax_nav.text(0.02, 0.96, '', transform=ax_nav.transAxes,
+    nav_time = ax_nav.text(0.02, 0.97, '', transform=ax_nav.transAxes,
                            color='#cccccc', fontsize=8, va='top', family='monospace')
     ax_nav.legend(loc='lower right', facecolor='#222222', labelcolor='white', fontsize=8)
+
+    # --- 1D Event Camera Vision Strip (Inset axis at the top of the nav view) ---
+    from matplotlib.colors import LinearSegmentedColormap
+    ax_vis = ax_nav.inset_axes([0.05, 0.88, 0.9, 0.03])
+    ax_vis.set_xticks([])
+    ax_vis.set_yticks([])
+    for spine in ax_vis.spines.values():
+        spine.set_edgecolor('#444444')
+    ax_vis.set_title('1D Event Camera Stream (Green=ON, Red=OFF)', color='#888888', fontsize=6, pad=1)
+    
+    colors_ev = [(0.8, 0.1, 0.1), (0.1, 0.1, 0.1), (0.1, 0.8, 0.1)]  # OFF event, no event, ON event
+    cm_ev = LinearSegmentedColormap.from_list('events_cmap', colors_ev, N=3)
+    vis_strip = ax_vis.imshow(np.zeros((1, N_PIXELS)), cmap=cm_ev, vmin=-1.0, vmax=1.0, aspect='auto')
 
     # --- Right panel: close-up wing mechanics (unchanged logic) ---
     ax_wing.set_aspect('equal')
@@ -432,6 +447,11 @@ def run_visualization(env, params, update_idx, vis_step_fn):
                     inside = (x0 <= cu <= x1) and (y0 <= cv <= y1)
                     op.set_facecolor('#cc1111' if inside else '#2a2a4c')
                     op.set_edgecolor('#ff3333' if inside else '#6666bb')
+
+                # Update 1D event camera vision strip
+                if frame < len(sim_data['events']):
+                    ev_frame = sim_data['events'][frame]
+                    vis_strip.set_data(ev_frame[None, :])
 
                 # SLAM text overlay
                 surprise_val = sim_data['surprise'][frame] if frame < len(sim_data['surprise']) else 0.0
