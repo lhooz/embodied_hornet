@@ -36,8 +36,49 @@ from hornetRL.pbt_manager import init_pbt_state, pbt_evolve
 
 # --- SLAM SYSTEM FROM neuro-symbolic-slam SUBMODULE ---
 # (sys.path for src/ is configured in embodied_hornet/__init__.py)
-from snn_slam_system import SNNSLAMSystem, N_DEPTH
+from snn_slam_system import SNNSLAMSystem, N_DEPTH, SpikingOccupancyGrid
 from sparse_forest import N_PIXELS, compute_tof_distance
+
+# ---------------------------------------------------------------------------
+# SOG Ray-Casting Helper (adapted from snn_live_slam.py)
+# ---------------------------------------------------------------------------
+def _get_ray_indices(cx, cy, cth, tof_dists, tof_angles, res, grid_size, offset_m=0.0, max_rays=300):
+    """Ray-cast 3 ToF beams into hit/free grid indices for SOG LIF update.
+    
+    All coordinates are already in SLAM space (0–10m).
+    offset_m: shift applied before converting to grid index (0 since we work in 0-10m directly).
+    """
+    hit_idx, free_idx = [], []
+    MAX_VALID_RANGE = 2.83  # max diagonal of 2m×2m room = √(2²+2²)
+
+    for i in range(3):
+        d = float(tof_dists[i])
+        trace_dist = min(d, MAX_VALID_RANGE)
+        # Free-space cells along the beam
+        for s in range(1, max(1, int(trace_dist / res))):
+            fx = cx + (s * res) * np.cos(cth + tof_angles[i])
+            fy = cy + (s * res) * np.sin(cth + tof_angles[i])
+            fix = int((fx + offset_m) / res)
+            fiy = int((fy + offset_m) / res)
+            if 0 <= fix < grid_size and 0 <= fiy < grid_size:
+                free_idx.append([fix, fiy])
+        # Hit cell at beam end
+        if d < MAX_VALID_RANGE:
+            hx = cx + d * np.cos(cth + tof_angles[i])
+            hy = cy + d * np.sin(cth + tof_angles[i])
+            ix = int((hx + offset_m) / res)
+            iy = int((hy + offset_m) / res)
+            if 0 <= ix < grid_size and 0 <= iy < grid_size:
+                hit_idx.append([ix, iy])
+
+    # Pad to static shape for JAX JIT
+    hit_pad  = np.full((max_rays, 2), -1, dtype=np.int32)
+    free_pad = np.full((max_rays, 2), -1, dtype=np.int32)
+    n_hit  = min(len(hit_idx),  max_rays)
+    n_free = min(len(free_idx), max_rays)
+    if n_hit  > 0: hit_pad[:n_hit]   = np.array(hit_idx)[:n_hit]
+    if n_free > 0: free_pad[:n_free] = np.array(free_idx)[:n_free]
+    return hit_pad, free_pad
 
 # ==============================================================================
 # 1. CONFIGURATION
@@ -55,8 +96,8 @@ class Config:
     TARGET_STATE = jnp.array([0.0, 0.0, 1.0, 0.2, 0.0, 0.0, 0.0, 0.0])
 
     # --- Arena Boundaries ---
-    # 1m × 1m physical arena (SLAM coordinate: ±0.5m → [0.5, 9.5]m in 10m SLAM space)
-    ARENA_W = 0.5
+    # 2m × 2m physical arena (SLAM coord = physical coord + 1.0 → [0,2]m, slam_scale=1×)
+    ARENA_W = 1.0
 
     # --- Time Scales ---
     DT = 3e-5               # Physics integration timestep (s)
@@ -78,7 +119,7 @@ class Config:
     ACTION_NOISE_SIGMA = 0.2
 
     TOTAL_UPDATES = 100000   
-
+    VIS_INTERVAL = 200
     CURRICULUM_RATIO = 0.5
     
     # --- PBT Hyperparameters ---
@@ -101,7 +142,7 @@ class Config:
 
     # --- Obstacle Collision ---
     OBS_PENALTY_WEIGHT = 50.0   # reward penalty per SLAM unit of penetration
-    OBS_SAFETY_SLAM    = 0.5    # safety buffer in SLAM units (≈5 cm physical)
+    OBS_SAFETY_SLAM    = 0.1    # safety buffer in SLAM units (10cm physical in 2m room)
 
     WARMUP_STEPS = 1        
 
@@ -185,14 +226,34 @@ def run_visualization(env, params, update_idx, vis_step_fn):
         'le_marker': [], 'hinge_marker': [], 't': [],
         'slam_pos': [],   # true physical position in SLAM space
         'slam_est': [],   # SLAM estimated position (world belief)
+        'imu_dr': [],     # raw IMU dead-reckoning trajectory (no SLAM correction)
         'surprise': [],   # SLAM surprise metric
         'tof': [],        # (3,) ToF distances per frame (SLAM metres)
         'heading': [],    # sensor heading (rad) per frame
         'events': [],     # (256,) 1D event camera frames
+        'active_places': [], # active place cell indices per frame
     }
+    
+    CANN_DT = 0.02
+    physics_dt = Config.DT * Config.SIM_SUBSTEPS * steps_per_frame
+    slam_time_acc = 0.0
+    ev_acc = np.zeros(256, dtype=np.float32)
+    kin_acc = np.zeros(3, dtype=np.float32)
+    kin_count = 0
+    
+    last_slam_est_u = 0.0
+    last_slam_est_v = 0.0
+    last_slam_est_th = 0.0
+    last_active_places = np.array([], dtype=np.int32)
+    last_slam_surprise = 0.0
     
     rng = jax.random.PRNGKey(update_idx)
     state = env.reset(rng, 1) 
+    
+    # Force the visualization agent to start exactly at nominal hover target (center of the room, zero velocity)
+    # to guarantee a clean start and provide the maximum safety buffer (1.0m) to the boundaries.
+    r_state_override = state[0].at[0].set(Config.TARGET_STATE)
+    state = (r_state_override,) + state[1:]
     
     active_props_batch = state[3] 
     real_props = jax.tree.map(lambda x: x[0], active_props_batch)
@@ -203,17 +264,49 @@ def run_visualization(env, params, update_idx, vis_step_fn):
     vis_slam = SNNSLAMSystem(jax.random.PRNGKey(update_idx + 999), n_depth=N_DEPTH)
     vis_slam.reset(1)
     
+    # Load hover specialist for stabilizing visual rollout via DNAG blending
+    _hover_pkl = os.path.join(os.path.dirname(__file__), "hover_params.pkl")
+    hover_fixed_params = None
+    if os.path.exists(_hover_pkl):
+        with open(_hover_pkl, "rb") as _f:
+            _hover_ckpt = pickle.load(_f)
+        hover_fixed_params = jax.tree.map(jnp.array, _hover_ckpt['params'])
+    hover_params_single = jax.tree.map(lambda x: x[0], hover_fixed_params) if hover_fixed_params is not None else None
+
     r_state_np_start = np.array(state[0][0])
-    start_slam_x = float(r_state_np_start[0]) * env._slam_scale + 5.0
-    start_slam_z = float(r_state_np_start[1]) * env._slam_scale + 5.0
+    start_slam_x = float(r_state_np_start[0]) * env._slam_scale + 1.0
+    start_slam_z = float(r_state_np_start[1]) * env._slam_scale + 1.0
     start_slam_th = float(r_state_np_start[2]) - 1.0  # sensor heading
-    vis_slam.initialize_from_gt(
+    env._prev_robot_state = None
+    vis_slam.initialize_pose(
         jnp.array([[start_slam_x, start_slam_z]]),
         jnp.array([start_slam_th]),
     )
     
-    slam_surprise = 0.0
+    last_slam_est_u = start_slam_x
+    last_slam_est_v = start_slam_z
+    last_slam_est_th = start_slam_th
+    dr_x = start_slam_x
+    dr_z = start_slam_z
+    dr_th = start_slam_th
+    raw_imu_x = start_slam_x
+    raw_imu_z = start_slam_z
+    raw_imu_th = start_slam_th
+    slam_est_u = start_slam_x
+    slam_est_v = start_slam_z
+    slam_est_th = start_slam_th
+    
     slam_prev_int = np.zeros(N_PIXELS, dtype=np.float32)
+
+    # Real Spiking Occupancy Grid — LIF neuron sheet (from snn_slam_system)
+    # 50×50 grid covering 10m×10m SLAM space at 0.2m/cell resolution.
+    # v_max=1.0: clamp membrane potential at spike threshold so the heatmap stays
+    # meaningful — cells that fire repeatedly saturate at 1.0 (walls/obstacles),
+    # cleared free-space cells are inhibited to negative values.
+    _sog = SpikingOccupancyGrid(map_size_m=2.0, res=0.04, offset_m=0.0, v_max=1.0)  # 50×50 grid, 4cm/cell, 2m room
+    _sog_state = _sog.init_state()
+    _TOF_ANGLES = [-np.pi/4, 0.0, np.pi/4]
+    sim_data['sog_states'] = []  # per-frame v_mem snapshots for animation replay
 
     current_step_counter = 0
 
@@ -225,17 +318,39 @@ def run_visualization(env, params, update_idx, vis_step_fn):
                 print(f"!!! Visualization stopped early due to NaN !!!")
                 break
             
-            state, f_nodal, w_pose, h_marker = vis_step_fn(env, state, params_single, current_step_counter)
+            slam_pose_jax = jnp.array([[slam_est_u, slam_est_v, slam_est_th]])
+            # Ensure step_idx is always above the warmup threshold so the physics
+            # engine never pins velocities to zero (mirrors training's phys_indices).
+            vis_step_idx = current_step_counter + Config.WARMUP_STEPS + 5
+            state, f_nodal, w_pose, h_marker = vis_step_fn(
+                env, state, params_single, vis_step_idx, jnp.array([last_slam_surprise]), hover_params_single, slam_pose_jax
+            )
             current_step_counter += 1
 
         r_state_np = np.array(state[0][0])  # (8,) physical state of agent 0
+        
+        # --- Check for early termination (crashes/OOR) to match closed-room physics ---
+        is_oor = (abs(r_state_np[0]) > Config.ARENA_W) or (abs(r_state_np[1]) > Config.ARENA_W)
+        _obs_np = np.array(env._obstacles) if env._obstacles is not None else np.zeros((0, 4))
+        slam_u = r_state_np[0] * env._slam_scale + 1.0
+        slam_v = r_state_np[1] * env._slam_scale + 1.0
+        def _in_any_obs(sx, sz):
+            if len(_obs_np) == 0: return False
+            return bool(np.any(
+                (_obs_np[:, 0] <= sx) & (_obs_np[:, 2] >= sx) &
+                (_obs_np[:, 1] <= sz) & (_obs_np[:, 3] >= sz)
+            ))
+        is_in_obs = _in_any_obs(slam_u, slam_v)
+        
+        if is_oor or is_in_obs:
+            print(f"!!! Visualization rollout stopped early due to {'boundary crash' if is_oor else 'obstacle collision'} !!!")
+            break
+
         sim_data['states'].append(r_state_np)
         sim_data['t'].append(current_step_counter * Config.DT)
         # Convert physical (x, z) → SLAM (u, v) for nav panel
         _slam_scale  = env._slam_scale
-        _slam_offset = 5.0
-        slam_u = r_state_np[0] * _slam_scale + _slam_offset
-        slam_v = r_state_np[1] * _slam_scale + _slam_offset
+        _slam_offset = 1.0
         sim_data['slam_pos'].append((slam_u, slam_v))
         
         # Camera/sensor heading is body pitch - 1.0 rad (facing forward)
@@ -250,26 +365,94 @@ def run_visualization(env, params, update_idx, vis_step_fn):
 
         # SLAM tracking for visualization
         ev_jax, kin_jax, tof_jax, slam_prev_int = env.compute_slam_sensors(
-            r_state_np, slam_prev_int
+            r_state_np, slam_prev_int, dt=physics_dt
         )
-        try:
-            pose_est, _, _, _, _, debug_gates = vis_slam.forward_step(
-                ev_jax, kin_jax, tof_jax,
-                inject_drift=False, autopilot_on=(slam_surprise < 0.60)
-            )
-            slam_est_u = float(pose_est[0, 0])
-            slam_est_v = float(pose_est[0, 1])
-            slam_est_th = float(pose_est[0, 2])
-            slam_surprise = float(1.0 - float(debug_gates['Raw_Match'][0]))
-        except Exception as _slam_err:
-            slam_est_u = sim_data['slam_est'][-1][0] if sim_data['slam_est'] else slam_u
-            slam_est_v = sim_data['slam_est'][-1][1] if sim_data['slam_est'] else slam_v
-            slam_est_th = sim_data['slam_est'][-1][2] if sim_data['slam_est'] else sensor_heading
-            slam_surprise = 0.0
+        
+        # Accumulate high-frequency events and kinematics for the 50Hz CANN SLAM
+        ev_acc += np.array(ev_jax[0])
+        kin_acc += np.array(kin_jax[0])
+        kin_count += 1
+        
+        # Dead-reckoning position integrator (high frequency)
+        dr_vx = float(r_state_np[4]) * env._slam_scale
+        dr_vz = float(r_state_np[5]) * env._slam_scale
+        dr_vth = float(r_state_np[6]) # angular velocity (yaw rate)
+        
+        # Integrate raw IMU dead-reckoning (without feedback correction)
+        raw_imu_x += dr_vx * physics_dt
+        raw_imu_z += dr_vz * physics_dt
+        raw_imu_th += dr_vth * physics_dt
+        raw_imu_th = (raw_imu_th + np.pi) % (2 * np.pi) - np.pi
+        sim_data['imu_dr'].append((raw_imu_x, raw_imu_z, raw_imu_th))
+        
+        # Proportional feedback correction towards CANN estimate (prevents steps/discontinuities)
+        K_CORR = 20.0
+        err_x = last_slam_est_u - dr_x
+        err_z = last_slam_est_v - dr_z
+        err_th = last_slam_est_th - dr_th
+        err_th = (err_th + np.pi) % (2 * np.pi) - np.pi
+        
+        dr_x += (dr_vx + K_CORR * err_x) * physics_dt
+        dr_z += (dr_vz + K_CORR * err_z) * physics_dt
+        dr_th += (dr_vth + K_CORR * err_th) * physics_dt
+        dr_th = (dr_th + np.pi) % (2 * np.pi) - np.pi
+        
+        slam_est_u = dr_x
+        slam_est_v = dr_z
+        slam_est_th = dr_th
 
+        # Trigger CANN update exactly every 10 steps to align time-scales and eliminate timing jitter
+        if (i + 1) % 10 == 0:
+            # Still run the CANN pipeline for place cell mapping at 50Hz (bio-faithful)
+            avg_kin = kin_acc / max(1, kin_count)
+            avg_ev = np.clip(ev_acc, -1.0, 1.0)
+            elapsed_time = 10 * physics_dt
+            
+            try:
+                scale_factor = elapsed_time / CANN_DT
+                pose_est, _, _, _, _, debug_gates = vis_slam.forward_step(
+                    jnp.array([avg_ev]), jnp.array([avg_kin * scale_factor]), tof_jax,
+                    inject_drift=False, autopilot_on=(last_slam_surprise < 0.60)
+                )
+                print(f"  [CANN UPDATE Step {i}] avg_kin (scaled): {avg_kin * scale_factor} | pose_est: {pose_est[0]}")
+                last_slam_surprise = float(1.0 - float(debug_gates['Raw_Match'][0]))
+                
+                # Use actual CANN SLAM output for position and heading display
+                last_slam_est_u = float(pose_est[0, 0])
+                last_slam_est_v = float(pose_est[0, 1])
+                last_slam_est_th = float(pose_est[0, 2])
+                
+                I_place_np = np.array(debug_gates['Debug_I_Place'][0])
+                max_val = np.max(I_place_np)
+                last_active_places = np.where(I_place_np > 0.1 * max_val)[0] if max_val > 1e-5 else np.array([], dtype=np.int32)
+                
+            except Exception as _slam_err:
+                print(f"!!! SLAM error at frame {current_step_counter}: {_slam_err}")
+                last_slam_surprise = 0.0
+                last_active_places = np.array([], dtype=np.int32)
+            
+            # Reset accumulators
+            ev_acc = np.zeros(256, dtype=np.float32)
+            kin_acc = np.zeros(3, dtype=np.float32)
+            kin_count = 0
+
+        print(f"[VIS FRAME {i:03d}] GT: ({slam_u:.3f}, {slam_v:.3f}) | SLAM: ({slam_est_u:.3f}, {slam_est_v:.3f}) | Surprise: {last_slam_surprise:.3f}")
+
+        sim_data['active_places'].append(last_active_places)
         sim_data['slam_est'].append((slam_est_u, slam_est_v, slam_est_th))
-        sim_data['surprise'].append(slam_surprise)
-        sim_data['events'].append(np.array(ev_jax[0]))
+        sim_data['surprise'].append(last_slam_surprise)
+        sim_data['events'].append(np.array(ev_jax[0])) # store raw high-freq events for visualization
+
+        # Real SOG update: ray-cast ToF beams, excite hits, inhibit free space
+        tof_d = sim_data['tof'][-1]
+        _hit_idx, _free_idx = _get_ray_indices(
+            slam_est_u, slam_est_v, slam_est_th,
+            tof_d, _TOF_ANGLES,
+            res=_sog.res, grid_size=_sog.grid_w, offset_m=_sog.offset_m,
+        )
+        _sog_state = _sog.update(_sog_state, jnp.array(_hit_idx), jnp.array(_free_idx))
+        # Snapshot the current v_mem for animation replay
+        sim_data['sog_states'].append(np.array(_sog_state.v_mem))
 
         f_st = state[1]
         sim_data['le_marker'].append(np.array(f_st.marker_le[0]))
@@ -277,29 +460,35 @@ def run_visualization(env, params, update_idx, vis_step_fn):
         sim_data['nodal_forces'].append(np.array(f_nodal[0]))
         sim_data['hinge_marker'].append(np.array(h_marker[0]))
 
+    # Store final sequence weights and SOG metadata
+    sim_data['final_W_seq'] = np.array(vis_slam.place_state.W_seq_to_place[0])
+    sim_data['sog_res'] = _sog.res
+    sim_data['sog_grid_w'] = _sog.grid_w
+
     # -----------------------------------------------------------------------
-    # Matplotlib Animation — two-panel layout
+    # Matplotlib Animation — three-panel layout
     # Left:  10m×10m navigation room (SLAM space) with obstacles + trajectory
+    # Center: Topological Map (Place cells + edges)
     # Right: close-up wing mechanics (as before)
     # -----------------------------------------------------------------------
-    fig, (ax_nav, ax_wing) = plt.subplots(1, 2, figsize=(14, 7))
+    fig, (ax_nav, ax_map, ax_wing) = plt.subplots(1, 3, figsize=(21, 7))
     fig.patch.set_facecolor('#0d0d0d')
-    for ax in (ax_nav, ax_wing):
+    for ax in (ax_nav, ax_map, ax_wing):
         ax.set_facecolor('#111111')
         ax.tick_params(colors='#aaaaaa')
         for spine in ax.spines.values():
             spine.set_edgecolor('#444444')
 
     # --- Left panel: navigation room ---
-    ax_nav.set_xlim(0, 10)
-    ax_nav.set_ylim(0, 10)
+    ax_nav.set_xlim(0, 2)
+    ax_nav.set_ylim(0, 2)
     ax_nav.set_aspect('equal')
     ax_nav.set_title('Navigation Room (SLAM Space)', color='white', fontsize=10)
     ax_nav.set_xlabel('X (m)', color='#aaaaaa')
     ax_nav.set_ylabel('Y (m)', color='#aaaaaa')
 
     # Draw room boundary
-    room_rect = plt.Rectangle((0, 0), 10, 10, linewidth=2, edgecolor='#00ffcc', facecolor='none')
+    room_rect = plt.Rectangle((0, 0), 2, 2, linewidth=2, edgecolor='#00ffcc', facecolor='none')
     ax_nav.add_patch(room_rect)
 
     # --- Draw obstacles as dynamic patches (re-colored on collision) ---
@@ -315,18 +504,56 @@ def run_visualization(env, params, update_idx, vis_step_fn):
     # Draw target in SLAM coords
     target_phys = np.array(Config.TARGET_STATE)
     _slam_scale  = env._slam_scale
-    _slam_offset = 5.0
+    _slam_offset = 1.0
     tgt_u = target_phys[0] * _slam_scale + _slam_offset
     tgt_v = target_phys[1] * _slam_scale + _slam_offset
     ax_nav.plot(tgt_u, tgt_v, marker='*', markersize=14, color='#ffdd00',
                 markeredgecolor='#ff8800', zorder=20, label='Target')
 
-    # --- Trajectory + hornet + heading arrow (animated) ---
+    # --- Trajectory + hornet + heading/velocity arrows (animated) ---
     traj_line, = ax_nav.plot([], [], '-', color='#00ff88', linewidth=1.0, alpha=0.6, zorder=5, label='Path (GT)')
     hornet_dot, = ax_nav.plot([], [], 'o', color='#ff4444', markersize=7, zorder=15, label='Hornet (GT)')
     slam_est_line, = ax_nav.plot([], [], ':', color='#ffa500', linewidth=1.2, alpha=0.8, zorder=6, label='Path (SLAM)')
     slam_est_dot, = ax_nav.plot([], [], 's', color='#ffa500', markersize=5, zorder=14, label='SLAM Pose')
-    heading_arr = ax_nav.quiver([], [], [], [], color='#ff8888', scale=20, width=0.004, zorder=16)
+    imu_dr_line, = ax_nav.plot([], [], '--', color='#00ffff', linewidth=0.8, alpha=0.5, zorder=4, label='Path (IMU DR)')
+    imu_dr_dot, = ax_nav.plot([], [], '^', color='#00ffff', markersize=5, zorder=13, label='IMU DR Pose')
+    heading_arr = ax_nav.quiver([0], [0], [0], [0], color='#ff8888', scale=1.0, scale_units='xy', width=0.006, headwidth=4, headlength=5, zorder=16, label='Sensor Heading')
+    slam_heading_arr = ax_nav.quiver([0], [0], [0], [0], color='#ffa500', scale=1.0, scale_units='xy', width=0.006, headwidth=4, headlength=5, zorder=15, label='SLAM Heading')
+    vel_arr = ax_nav.quiver([0], [0], [0], [0], color='#ff33ff', scale=1.0, scale_units='xy', width=0.006, headwidth=4, headlength=5, zorder=16, label='Velocity')
+
+    # --- Center panel: Spiking Occupancy Grid (Robot Memory) ---
+    ax_map.set_aspect('equal')
+    ax_map.set_title('Spiking Occupancy Grid (Robot Memory)', color='white', fontsize=10)
+    ax_map.set_xlabel('X (m)', color='#aaaaaa')
+    ax_map.set_ylabel('Y (m)', color='#aaaaaa')
+
+    # Initialize SOG heatmap (replayed from pre-computed LIF v_mem snapshots)
+    # extent=[left, right, bottom, top] maps grid indices to physical coords (0-2m)
+    SOG_EXTENT = [0, 2, 0, 2]
+    _grid_n = sim_data.get('sog_grid_w', 50)
+    occ_display = np.zeros((_grid_n, _grid_n), dtype=np.float32)
+    occ_img = ax_map.imshow(
+        occ_display, origin='lower', extent=SOG_EXTENT,
+        cmap='magma', vmin=-0.2, vmax=1.0, aspect='equal', zorder=1,
+    )
+    # Robot position marker on the map
+    map_robot_dot, = ax_map.plot([], [], 'o', color='#00ffcc', markersize=5, zorder=10, label='Robot')
+    map_trail_line, = ax_map.plot([], [], '-', color='#00ffcc', linewidth=0.8, alpha=0.4, zorder=5, label='Trail')
+
+    # --- 3 ToF beam artists on SOG map (Robot Memory / CANN belief space) ---
+    _beam_colours = ['#00aaff', '#ffff44', '#00aaff']
+    map_tof_beam_artists = []
+    for _bc in _beam_colours:
+        # We use thinner, slightly translucent lines to avoid cluttering the heatmap
+        _bl, = ax_map.plot([], [], '-',  color=_bc, linewidth=1.2, alpha=0.6, zorder=12)
+        _bm, = ax_map.plot([], [], 'D',  color=_bc, markersize=3,  alpha=0.7, zorder=13)
+        map_tof_beam_artists.append((_bl, _bm))
+
+    # --- Camera FOV boundary dashes on SOG map ---
+    map_fov_left_line,  = ax_map.plot([], [], '--', color='#ffff88', linewidth=0.6, alpha=0.3, zorder=3)
+    map_fov_right_line, = ax_map.plot([], [], '--', color='#ffff88', linewidth=0.6, alpha=0.3, zorder=3)
+
+    ax_map.legend(loc='lower right', facecolor='#222222', labelcolor='white', fontsize=8)
 
     # --- 3 ToF beam artists: [left, center, right] ---
     _beam_colours = ['#00aaff', '#ffff44', '#00aaff']
@@ -364,6 +591,19 @@ def run_visualization(env, params, update_idx, vis_step_fn):
     ax_wing.set_ylabel('Z (m)', color='#aaaaaa')
     ax_wing.grid(True, linestyle=':', alpha=0.2, color='#444444')
 
+    # Draw physical room boundaries (±1.0m)
+    room_rect_wing = plt.Rectangle((-1.0, -1.0), 2.0, 2.0, linewidth=2, edgecolor='#00ffcc', facecolor='none', linestyle='--', zorder=2)
+    ax_wing.add_patch(room_rect_wing)
+
+    # Draw physical obstacles (converted from SLAM [0,2]m by subtracting 1.0)
+    obs_patch_wing_list = []
+    for obs in obstacles_np:
+        px0, py0, px1, py1 = obs - 1.0
+        p_wing = plt.Rectangle((px0, py0), px1 - px0, py1 - py0,
+                               facecolor='#2a2a4c', edgecolor='#6666bb', linewidth=1, alpha=0.8, zorder=3)
+        ax_wing.add_patch(p_wing)
+        obs_patch_wing_list.append((obs - 1.0, p_wing))
+
     patch_thorax = patches.Ellipse((0,0), linewidth=1.0, width=0.012, height=0.006,
                                    facecolor='#555555', edgecolor='#aaaaaa', zorder=10)
     patch_head   = patches.Circle((0,0), linewidth=1.0, radius=0.0025,
@@ -384,6 +624,9 @@ def run_visualization(env, params, update_idx, vis_step_fn):
     quiver = ax_wing.quiver(dummy, dummy, dummy, dummy, color='#ff6666',
                              scale=3.0, scale_units='xy', zorder=20, width=0.0002)
     time_text = ax_wing.text(0.02, 0.95, '', transform=ax_wing.transAxes, color='#cccccc', fontsize=8)
+
+    # SOG animation: replay pre-computed v_mem snapshots
+    _sog_grid_w = sim_data.get('sog_grid_w', 50)
 
     def update(frame):
         if frame >= len(sim_data['states']): return
@@ -406,22 +649,78 @@ def run_visualization(env, params, update_idx, vis_step_fn):
             traj_line.set_data(xs, ys)
             hornet_dot.set_data([xs[-1]], [ys[-1]])
             
-            # SLAM estimated path and pose dot (world belief)
+            # SLAM estimated path, pose dot, and heading arrow (world belief)
             if frame < len(sim_data['slam_est']):
                 est_pts = sim_data['slam_est']
                 est_xs = [p[0] for p in est_pts[:frame+1]]
                 est_ys = [p[1] for p in est_pts[:frame+1]]
+                est_th = est_pts[frame][2]
                 slam_est_line.set_data(est_xs, est_ys)
                 slam_est_dot.set_data([est_xs[-1]], [est_ys[-1]])
-
-            heading_arr.set_offsets([[xs[-1], ys[-1]]])
-            heading_arr.set_UVC([np.cos(r_th)], [np.sin(r_th)])
+                slam_heading_arr.set_offsets([[est_xs[-1], est_ys[-1]]])
+                slam_heading_arr.set_UVC([0.2 * np.cos(est_th)], [0.2 * np.sin(est_th)])
+                
+            # Raw IMU dead-reckoning path and pose dot
+            if frame < len(sim_data['imu_dr']):
+                imu_pts = sim_data['imu_dr']
+                imu_xs = [p[0] for p in imu_pts[:frame+1]]
+                imu_ys = [p[1] for p in imu_pts[:frame+1]]
+                imu_dr_line.set_data(imu_xs, imu_ys)
+                imu_dr_dot.set_data([imu_xs[-1]], [imu_ys[-1]])
 
             # === SLAM sensor layer ===
             if frame < len(sim_data['tof']):
                 tof_d = sim_data['tof'][frame]      # (3,) SLAM distances
                 hdg   = sim_data['heading'][frame]  # theta (rad)
                 cu, cv = xs[-1], ys[-1]
+
+                # Update heading arrow pointing in sensor heading
+                heading_arr.set_offsets([[cu, cv]])
+                heading_arr.set_UVC([0.2 * np.cos(hdg)], [0.2 * np.sin(hdg)])
+
+                # Update velocity arrow in SLAM coordinates
+                vx_phys = r_state[4]
+                vz_phys = r_state[5]
+                vx_slam = vx_phys * env._slam_scale  # slam_scale=1.0, identity
+                vy_slam = vz_phys * env._slam_scale
+                vel_arr.set_offsets([[cu, cv]])
+                vel_arr.set_UVC([0.2 * vx_slam], [0.2 * vy_slam])
+
+                # --- Update Occupancy Grid (Center Panel) — replay SOG v_mem ---
+                if frame < len(sim_data['sog_states']) and frame < len(sim_data['slam_est']):
+                    est_u, est_v, est_th = sim_data['slam_est'][frame]
+                    v_mem = sim_data['sog_states'][frame]  # (grid_w, grid_h) float32
+                    # v_mem axes: [x, y]. imshow expects [row=y, col=x], so transpose.
+                    # Fixed clim: v_mem is clamped at v_max=1.0 (spike threshold);
+                    # free space is inhibited to ~-0.2; walls/obstacles saturate at 1.0.
+                    occ_img.set_data(v_mem.T)
+                    occ_img.set_clim(vmin=-0.2, vmax=1.0)
+
+                    # Update robot dot and trail on the map
+                    map_robot_dot.set_data([est_u], [est_v])
+                    trail_pts = sim_data['slam_est'][:frame+1]
+                    map_trail_line.set_data(
+                        [p[0] for p in trail_pts],
+                        [p[1] for p in trail_pts],
+                    )
+
+                    # Update ToF beams on SOG map (hinged to CANN/observer belief)
+                    for bi, ((bl, bm), offset) in enumerate(
+                            zip(map_tof_beam_artists, [-np.pi/4, 0.0, np.pi/4])):
+                        ang = est_th + offset
+                        hu  = est_u + tof_d[bi] * np.cos(ang)
+                        hv  = est_v + tof_d[bi] * np.sin(ang)
+                        bl.set_data([est_u, hu], [est_v, hv])
+                        bm.set_data([hu], [hv])
+
+                    # Update FOV boundary on SOG map (hinged to CANN/observer belief)
+                    fov_r = 1.2
+                    map_fov_left_line.set_data(
+                        [est_u, est_u + fov_r * np.cos(est_th - np.pi/4)],
+                        [est_v, est_v + fov_r * np.sin(est_th - np.pi/4)])
+                    map_fov_right_line.set_data(
+                        [est_u, est_u + fov_r * np.cos(est_th + np.pi/4)],
+                        [est_v, est_v + fov_r * np.sin(est_th + np.pi/4)])
 
                 # 3 ToF beams: left/center/right at ±45° from heading
                 for bi, ((bl, bm), offset) in enumerate(
@@ -433,7 +732,7 @@ def run_visualization(env, params, update_idx, vis_step_fn):
                     bm.set_data([hu], [hv])
 
                 # FOV boundary (90° camera cone)
-                fov_r = 6.0  # display range (SLAM m)
+                fov_r = 1.2  # display range (physical m = SLAM m)
                 fov_left_line.set_data(
                     [cu, cu + fov_r * np.cos(hdg - np.pi/4)],
                     [cv, cv + fov_r * np.sin(hdg - np.pi/4)])
@@ -461,9 +760,16 @@ def run_visualization(env, params, update_idx, vis_step_fn):
             else:
                 nav_time.set_text(f'T={t:.3f}s')
 
-        # -- right panel: wing mechanics --
-        ax_wing.set_xlim(rx - 0.06, rx + 0.06)
-        ax_wing.set_ylim(rz - 0.06, rz + 0.06)
+        # -- right panel: wing mechanics (zoomed out to 30cm window for context) --
+        ax_wing.set_xlim(rx - 0.15, rx + 0.15)
+        ax_wing.set_ylim(rz - 0.15, rz + 0.15)
+
+        # Highlight obstacles on collision in wing panel
+        for obs_phys, op_wing in obs_patch_wing_list:
+            px0, py0, px1, py1 = obs_phys
+            inside = (px0 <= rx <= px1) and (py0 <= rz <= py1)
+            op_wing.set_facecolor('#cc1111' if inside else '#2a2a4c')
+            op_wing.set_edgecolor('#ff3333' if inside else '#6666bb')
 
         d1 = real_props.d1
         d2 = real_props.d2
@@ -484,14 +790,14 @@ def run_visualization(env, params, update_idx, vis_step_fn):
         wing_x   = wx + x_local * c_w
         wing_z   = wz + x_local * s_w
         real_line.set_data(wing_x, wing_z)
-        patch_le.set_center((le_pos[0], le_pos[1]))
+        patch_le.set_center((wing_x[0], wing_z[0]))
         patch_hinge.set_center((hinge_p[0], hinge_p[1]))
         pts = np.stack([wing_x, wing_z], axis=1)
         quiver.set_offsets(pts)
         quiver.set_UVC(f_nodal[:, 0], f_nodal[:, 1])
         time_text.set_text(f'T={t:.4f}s | Z={rz:.3f}m')
 
-        return patch_thorax, patch_le, patch_hinge, traj_line, hornet_dot
+        return patch_thorax, patch_le, patch_hinge, traj_line, hornet_dot, slam_est_line, slam_est_dot, imu_dr_line, imu_dr_dot, heading_arr, slam_heading_arr
 
     plt.tight_layout()
     ani = animation.FuncAnimation(fig, update, frames=len(sim_data['states']), interval=20, blit=False)
@@ -662,8 +968,8 @@ def train():
         B = Config.BATCH_SIZE
         initial_weighted_belief = jnp.zeros((B, 4))
         
-        # Convert SLAM pose from 10m space → hornet physical metres for Instar routing
-        # slam_pose[:2] = (x, y) in 10m space;  slam_pose[2] = heading (same units)
+        # Convert SLAM pose from physical 2m space → hornet physical metres for Instar routing
+        # slam_pose[:2] = (x, y) in physical SLAM (= hornet + 1.0); slam_pose[2] = heading
         slam_xy_hornet = (slam_pose[:2] - _SLAM_OFFSET_TRAIN) / env._slam_scale
         slam_pose_hornet = jnp.concatenate([slam_xy_hornet, slam_pose[2:3]])  # (3,)
         frozen_pose  = jnp.broadcast_to(slam_pose_hornet, (B, 3))    # same pose for all agents
@@ -758,7 +1064,7 @@ def train():
             # Convert physical (x, z) → SLAM space and compute signed distance to obstacles.
             # Positive = outside all obstacles, Negative = penetrating (inside).
             _slam_sc  = env._slam_scale
-            _slam_off = 5.0
+            _slam_off = 1.0
             cur_su = curr_robot[:, 0] * _slam_sc + _slam_off  # (B,) SLAM x
             cur_sz = curr_robot[:, 1] * _slam_sc + _slam_off  # (B,) SLAM z
 
@@ -860,7 +1166,7 @@ def train():
         return total_loss, (logs, final_full)
 
     # Constant needed inside loss_fn (mirrors env._SLAM_OFFSET)
-    _SLAM_OFFSET_TRAIN = 5.0
+    _SLAM_OFFSET_TRAIN = 1.0  # physical: hornet ±ARENA_W → SLAM [0, 2m]
 
     @jax.jit
     def update(params, opt_state, full_state, pbt_state, key, slam_pose, slam_surprise, obstacles):
@@ -893,10 +1199,10 @@ def train():
 
     # Bootstrap SLAM from agent-0's initial pose (centre of 10m room)
     init_robot0  = np.array(curr_state[0][0])            # (8,) hornet state
-    init_slam_x  = float(init_robot0[0]) * env._slam_scale + 5.0
-    init_slam_z  = float(init_robot0[1]) * env._slam_scale + 5.0
+    init_slam_x  = float(init_robot0[0]) * env._slam_scale + 1.0
+    init_slam_z  = float(init_robot0[1]) * env._slam_scale + 1.0
     init_slam_th = float(init_robot0[2]) - 1.0  # sensor heading (facing forward)
-    slam_system.initialize_from_gt(
+    slam_system.initialize_pose(
         jnp.array([[init_slam_x, init_slam_z]]),
         jnp.array([init_slam_th]),
     )
@@ -917,16 +1223,18 @@ def train():
         Returns updated slam_pose, slam_surprise, slam_prev_int.
         """
         nonlocal slam_prev_int
-        env.regenerate_arena(key=key)
+        if key is not None:
+            env.regenerate_arena(key=key)
+        env._prev_robot_state = None
 
         # Re-initialise SLAM from agent-0's current pose in the new room
         r0 = np.array(curr_agent0_state)
-        new_slam_x  = float(r0[0]) * env._slam_scale + 5.0
-        new_slam_z  = float(r0[1]) * env._slam_scale + 5.0
+        new_slam_x  = float(r0[0]) * env._slam_scale + 1.0
+        new_slam_z  = float(r0[1]) * env._slam_scale + 1.0
         new_slam_th = float(r0[2]) - 1.0  # sensor heading (facing forward)
 
         slam_system.reset(1)
-        slam_system.initialize_from_gt(
+        slam_system.initialize_pose(
             jnp.array([[new_slam_x, new_slam_z]]),
             jnp.array([new_slam_th]),
         )
@@ -935,6 +1243,30 @@ def train():
         new_slam_pose = jnp.array([new_slam_x, new_slam_z, new_slam_th])
         print(f"    ---> New arena + SLAM reset: pose ({new_slam_x:.2f}, {new_slam_z:.2f}) m, sensor heading {new_slam_th:.2f} rad")
         return new_slam_pose, 0.0  # fresh room → surprise starts at 0
+
+    def _reinit_slam_on_crash(curr_agent0_state):
+        """
+        Called when agent-0 crashes and resets individually.
+        Resets and re-initialises the SLAM tracker to match the fresh spawn position,
+        without regenerating the obstacle distribution of the arena.
+        """
+        nonlocal slam_prev_int
+        env._prev_robot_state = None
+        r0 = np.array(curr_agent0_state)
+        new_slam_x  = float(r0[0]) * env._slam_scale + 1.0
+        new_slam_z  = float(r0[1]) * env._slam_scale + 1.0
+        new_slam_th = float(r0[2]) - 1.0
+
+        slam_system.reset(1)
+        slam_system.initialize_pose(
+            jnp.array([[new_slam_x, new_slam_z]]),
+            jnp.array([new_slam_th]),
+        )
+        slam_prev_int = np.zeros(N_PIXELS, dtype=np.float32)
+
+        new_slam_pose = jnp.array([new_slam_x, new_slam_z, new_slam_th])
+        print(f"    [SLAM RESET ON CRASH] Re-initialized at ({new_slam_x:.2f}, {new_slam_z:.2f}) m")
+        return new_slam_pose, 0.0
 
     # --- JIT Compilation ---
     print("---> Compiling JAX Update...")
@@ -966,17 +1298,20 @@ def train():
         # Compute sensor bundle from the final state of this horizon
         robot0_np = np.array(next_state[0][0])  # (8,) agent-0 hornet state
         ev_jax, kin_jax, tof_jax, slam_prev_int = env.compute_slam_sensors(
-            robot0_np, slam_prev_int
+            robot0_np, slam_prev_int, dt=Config.HORIZON * Config.SIM_SUBSTEPS * Config.DT
         )
-        # Run one SLAM step (closed-loop with full memory + loop closure detection)
+        # Run SLAM steps (closed-loop with full memory + loop closure detection)
+        # 3 steps (3 x 0.02s = 0.06s) align the SLAM time-scale with the 32-step physical horizon (0.069s)
         try:
-            pose_est, _, _, _, _, debug_gates = slam_system.forward_step(
-                ev_jax, kin_jax, tof_jax,
-                inject_drift=False, autopilot_on=(slam_surprise < 0.60)
-            )
+            kin_jax_scaled = kin_jax * 1.152
+            for _ in range(3):
+                pose_est, _, _, _, _, debug_gates = slam_system.forward_step(
+                    ev_jax, kin_jax_scaled, tof_jax,
+                    inject_drift=False, autopilot_on=(slam_surprise < 0.60)
+                )
             slam_pose     = jnp.array([
-                float(pose_est[0, 0]),   # x in 10m space
-                float(pose_est[0, 1]),   # y in 10m space
+                float(pose_est[0, 0]),   # x in 2m space
+                float(pose_est[0, 1]),   # y in 2m space
                 float(pose_est[0, 2]),   # heading
             ])
             slam_surprise = float(1.0 - float(debug_gates['Raw_Match'][0]))
@@ -991,6 +1326,7 @@ def train():
             opt_state = _prev_opt_state  # restore last-known-good optimizer state
             rng, k_res = jax.random.split(rng)
             curr_state = env.reset(k_res, Config.BATCH_SIZE)
+            slam_pose, slam_surprise = _reinit_slam_on_crash(curr_state[0][0])
             continue
         
         r_state = next_state[0]
@@ -1000,8 +1336,8 @@ def train():
         is_oor = (jnp.abs(r_state[:, 0]) > Config.ARENA_W) | (jnp.abs(r_state[:, 1]) > Config.ARENA_W)
         # Obstacle collision: check in SLAM space using numpy (fast, outside JIT)
         _obs_np     = np.array(env._obstacles) if env._obstacles is not None else np.zeros((0, 4))
-        _slam_xs_np = np.array(r_state[:, 0]) * float(env._slam_scale) + 5.0
-        _slam_zs_np = np.array(r_state[:, 1]) * float(env._slam_scale) + 5.0
+        _slam_xs_np = np.array(r_state[:, 0]) * float(env._slam_scale) + 1.0
+        _slam_zs_np = np.array(r_state[:, 1]) * float(env._slam_scale) + 1.0
         def _in_any_obs(sx, sz):
             if len(_obs_np) == 0: return False
             return bool(np.any(
@@ -1020,6 +1356,11 @@ def train():
             lambda x, y: jnp.where(jnp.reshape(reset_mask, (-1,) + (1,)*(x.ndim-1)), y, x),
             next_state, fresh_state
         )
+
+        # 🌟 CRITICAL FIX: If agent 0 (tracked by SLAM) crashed and reset,
+        # we must reset the SLAM tracker to match its new spawn position!
+        if reset_mask[0]:
+            slam_pose, slam_surprise = _reinit_slam_on_crash(curr_state[0][0])
 
         # 3. Telemetry & Logging
         dt_epoch = time.time() - t0              
@@ -1078,10 +1419,11 @@ def train():
             if performed_pbt:
                 print("    -> PBT Mutation applied. Forcing Environment + Arena Reset.")
             rng, k_arena = jax.random.split(rng)
-            slam_pose, slam_surprise = _reset_slam_for_new_arena(
-                k_arena, curr_state[0][0]  # agent-0's state before reset
-            )
+            env.regenerate_arena(key=k_arena)
             curr_state = env.reset(rng, Config.BATCH_SIZE)
+            slam_pose, slam_surprise = _reset_slam_for_new_arena(
+                None, curr_state[0][0]  # agent-0's new spawn state
+            )
 
         print(f"Step {i:04d} | Epoch: {dt_epoch:.2f}s | Total: {total_elapsed/60:.1f}min | "
               f"Loss: {loss:.1e} (A:{logs['act_loss']:.1e} C:{logs['crit_loss']:.1e}) | "
@@ -1091,7 +1433,7 @@ def train():
               f"MeanPos: [{mean_x:+.2f}, {mean_z:+.2f}]\n"
               f"    -> Phys: [Hum:{raw_hum_energy:.0f} | ThVel:{thorax_mag:.2f} rad/s]")
     
-        if i % Config.VIS_INTERVAL == 0:
+        if i % Config.VIS_INTERVAL == 0 or i == start_step:
             ckpt_path = os.path.join(Config.CKPT_DIR, f"shac_params_{i}.pkl")
             with open(ckpt_path, "wb") as f:
                 pickle.dump({
@@ -1104,7 +1446,7 @@ def train():
 
 # Global Visualization Step
 @partial(jax.jit, static_argnums=(0,))
-def vis_step_fn(env, curr_state, curr_params, step_idx):
+def vis_step_fn(env, curr_state, curr_params, step_idx, slam_surprise, hover_params_single, slam_pose):
     r_st = curr_state[0]
     B = r_st.shape[0]
     
@@ -1114,7 +1456,10 @@ def vis_step_fn(env, curr_state, curr_params, step_idx):
     scaled_obs = symlog(obs_v)
     
     # 2. Ingest visual-spatial belief features
-    pose_belief = r_st[:, :3]
+    # Convert SLAM pose from physical SLAM space → hornet physical metres for Instar routing
+    slam_xy_hornet = (slam_pose[:, :2] - 1.0) / env._slam_scale
+    pose_belief = jnp.concatenate([slam_xy_hornet, slam_pose[:, 2:3]], axis=-1)
+    
     norm_csnn = jnp.zeros((B, 256)).at[:, 0].set(1.0)
     norm_stdp = jnp.zeros((B, 256)).at[:, 0].set(1.0)
     visual_features = (norm_csnn, norm_stdp)
@@ -1128,8 +1473,29 @@ def vis_step_fn(env, curr_state, curr_params, step_idx):
     # 3. Policy Inference
     mods, _, _ = ac_model.apply(curr_params, combined_obs)
     
+    # --- LYAPUNOV HOVER & ATTENTION GATING (DNAG) ---
+    dist_floor = jnp.clip(
+        jnp.sqrt(jnp.sum((r_st[:, :2] - Config.TARGET_STATE[:2])**2, axis=-1) + 1e-8) * 2.0,
+        0.0, 1.0
+    )
+    sim_surprise = jnp.maximum(slam_surprise, dist_floor)
+    
+    if hover_params_single is not None:
+        hover_mods, _, _ = hover_ac_model.apply(hover_params_single, scaled_obs)
+    else:
+        # Fallback: velocity-zeroed policy
+        hover_robot = r_st.at[:, 4:8].set(0.0)
+        hover_wrapped = jnp.mod(hover_robot[:, 2] + jnp.pi, 2 * jnp.pi) - jnp.pi
+        hover_obs_raw = hover_robot.at[:, 2].set(hover_wrapped)
+        hover_obs = jnp.concatenate([symlog(hover_obs_raw), weighted_belief], axis=-1)
+        hover_mods, _, _ = ac_model.apply(curr_params, hover_obs)
+        
+    blended_mods, alpha = jax.vmap(differentiable_attention_gate)(sim_surprise, mods, hover_mods)
+    alpha_floored = jnp.maximum(alpha, Config.DNAG_MIN_ALPHA)
+    blended_mods = (1.0 - alpha_floored) * mods + alpha_floored * hover_mods
+    
     # 4. Env Step
-    next_state, _, f_nodal, w_pose, h_marker = env.step_batch(next_state, mods, step_idx=step_idx)
+    next_state, _, f_nodal, w_pose, h_marker = env.step_batch(next_state, blended_mods, step_idx=step_idx)
     
     return next_state, f_nodal, w_pose, h_marker
 

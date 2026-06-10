@@ -25,18 +25,15 @@ from sparse_forest import (
 # SLAM COORDINATE MAPPING
 # ==============================================================================
 # The hornet flies in a physical arena of ±ARENA_W metres.
-# sparse_forest generates a 10m × 10m room with biologically-scaled obstacles
-# (0.1-0.7m in 10m-space ≈ 1-7mm at hornet scale — twigs/stems).
-# We linearly map hornet coordinates into this 10m room so the SLAM system
-# receives sensor data in its native coordinate frame.
+# SLAM and physical coordinates are now identical — no scaling.
+# We only apply a +ARENA_W offset so the room spans [0, 2*ARENA_W] metres
+# (positive quadrant) matching sparse_forest.py's [0, ROOM_W] convention.
 #
-#   slam_coord = hornet_coord * SLAM_SCALE + SLAM_OFFSET
-#   SLAM_SCALE = 5.0 / ARENA_W   →  [-ARENA_W, ARENA_W] maps to [0.5, 9.5] m
-#   SLAM_OFFSET = 5.0            →  centres the hornet in the room
+#   slam_coord = hornet_coord + _SLAM_OFFSET
+#   _SLAM_OFFSET = ARENA_W = 1.0  →  [−ARENA_W, +ARENA_W] maps to [0, 2*ARENA_W]
 #
-# The SLAM map, poses, and loop closures are all in 10m space.
-# Only the Instar routing uses pose_belief converted BACK to hornet metres.
-_SLAM_OFFSET = 5.0   # centre of the 10m room
+# Velocities pass through unchanged (slam_scale = 1.0, identity).
+_SLAM_OFFSET = 1.0   # half of 2m room = centre offset
 
 # ==============================================================================
 # ROBUST ENVIRONMENT
@@ -63,13 +60,13 @@ class FlyEnv:
         )
         self.target = config.TARGET_STATE
 
-        # --- Arena geometry for SLAM sensor generation ---
-        # Scale factor: maps hornet ±ARENA_W metres into [0.5, 9.5] of the 10m room.
-        # With ARENA_W=0.5 (1m×1m arena): slam_scale = 10.0×
-        self._slam_scale  = _SLAM_OFFSET / getattr(config, 'ARENA_W', 0.5)
+        # slam_scale = 1.0 (physical units, no scaling). +_SLAM_OFFSET shifts
+        # hornet's ±ARENA_W range into [0, 2*ARENA_W] positive-quadrant SLAM room.
+        self._slam_scale  = 1.0
         self._obstacles   = None  # set by regenerate_arena()
         self._segments    = None
         self._tex_tensor  = None
+        self._prev_robot_state = None
         self.regenerate_arena(seed=42, quiet=True)  # initial room
 
     # ------------------------------------------------------------------
@@ -107,8 +104,7 @@ class FlyEnv:
         self._segments   = segments_jax
         self._tex_tensor = tex_tensor
         if not quiet:
-            print(f"---> Arena regenerated: 10m×10m, {len(obstacles_np)} obstacles "
-                  f"(scale {self._slam_scale:.1f}×, seed {seed})")
+            print(f"---> Arena regenerated: 2m×2m physical, {len(obstacles_np)} obstacles (seed {seed})")
 
     def reset(self, key, batch_size):
         """
@@ -457,6 +453,7 @@ class FlyEnv:
         self,
         robot_state_single: np.ndarray,
         prev_intensities: np.ndarray,
+        dt: float = 0.00216,
     ):
         """
         Computes event-camera, ToF, and kinematic odometry for ONE agent.
@@ -467,6 +464,7 @@ class FlyEnv:
         Args:
             robot_state_single: (8,) numpy array  [x, z, theta, phi, vx, vz, w_theta, w_phi]
             prev_intensities:   (N_PIXELS,) numpy array — intensity frame from previous call
+            dt:                 float — time elapsed since previous call
 
         Returns:
             ev_jax:        (1, N_PIXELS) JAX array  — event frame (batched for SLAM)
@@ -499,7 +497,37 @@ class FlyEnv:
         tof_jax = compute_tof_distance(slam_pos, sensor_heading, self._segments)
 
         # 4. Kinematic odometry [vx, vz, w_theta] (physical hornet units — m/s, rad/s)
-        kin = np.array(robot_state_single[4:7], dtype=np.float32)
+        # Compute smooth average velocity from position change to avoid aliasing wingbeat oscillations
+        if self._prev_robot_state is not None:
+            # Check if there was a teleport/reset
+            dist = np.sqrt((robot_state_single[0] - self._prev_robot_state[0])**2 + 
+                           (robot_state_single[1] - self._prev_robot_state[1])**2)
+            if dist < 0.5:  # normal step, not a spawn/reset teleport
+                vx_glob = (robot_state_single[0] - self._prev_robot_state[0]) / dt
+                vz_glob = (robot_state_single[1] - self._prev_robot_state[1]) / dt
+                # Circular difference for heading
+                w_theta = (robot_state_single[2] - self._prev_robot_state[2] + np.pi) % (2 * np.pi) - np.pi
+                w_theta = w_theta / dt
+            else:
+                vx_glob = float(robot_state_single[4])
+                vz_glob = float(robot_state_single[5])
+                w_theta = float(robot_state_single[6])
+        else:
+            vx_glob = float(robot_state_single[4])
+            vz_glob = float(robot_state_single[5])
+            w_theta = float(robot_state_single[6])
+            
+        self._prev_robot_state = robot_state_single.copy()
+
+        # Convert global velocities [vx_glob, vz_glob] to forward/lateral in the sensor-frame
+        # to match the CANN and cerebellum's expected coordinate system.
+        cos_sh = np.cos(sensor_heading)
+        sin_sh = np.sin(sensor_heading)
+        
+        vx_sensor = (vx_glob * cos_sh + vz_glob * sin_sh) * self._slam_scale
+        vz_sensor = (-vx_glob * sin_sh + vz_glob * cos_sh) * self._slam_scale
+        
+        kin = np.array([vx_sensor, vz_sensor, w_theta], dtype=np.float32)
 
         # Return batched (B=1) JAX arrays matching SNNSLAMSystem.forward_step() signature
         ev_jax  = jnp.array(events[None, :])          # (1, N_PIXELS)

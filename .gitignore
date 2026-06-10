@@ -20,6 +20,9 @@ dist/
 .idea/
 .vscode/
 
+# Local debug scripts
+debug_scripts/
+
 # Training outputs (checkpoint PKLs excluded; hover_params is a tracked asset)
 checkpoints_shac/
 *.pkl
@@ -30,3 +33,4 @@ checkpoints_shac/
 
 # Jupyter
 .ipynb_checkpoints/
+
