@@ -31,8 +31,8 @@ def _make_telemetry_step(original_forward_step):
     Wraps a system's forward_step to emit surprise telemetry after each call.
     """
     @functools.wraps(original_forward_step)
-    def _patched_forward_step(ev_jax, kin_jax, tof_jax, **kwargs):
-        result = original_forward_step(ev_jax, kin_jax, tof_jax, **kwargs)
+    def _patched_forward_step(*args, **kwargs):
+        result = original_forward_step(*args, **kwargs)
         pose_cl, r_place, r_ring, is_confident, peak_idx_place, debug_gates = result
 
         # Compute surprise from debug gates (same formula as original)

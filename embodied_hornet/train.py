@@ -25,7 +25,7 @@ from typing import NamedTuple
 from functools import partial
 
 # --- INTEGRATION MODULES (modified for embodied_hornet) ---
-from .neural_idapbc import policy_network_icnn, differentiable_attention_gate, unpack_action, ScaleConfig
+from .neural_idapbc import policy_network_icnn, differentiable_attention_gate, unpack_action, ScaleConfig, compute_sog_repulsive_force
 from .env import FlyEnv
 
 # --- BASE MODULES FROM hornetRL SIBLING REPO ---
@@ -118,9 +118,13 @@ class Config:
     OBS_NOISE_SIGMA = 0.002  
     ACTION_NOISE_SIGMA = 0.2
 
-    TOTAL_UPDATES = 100000   
+    TOTAL_UPDATES = 100000
     VIS_INTERVAL = 200
     CURRICULUM_RATIO = 0.5
+    
+    # --- Obstacle Avoidance Gains ---
+    K_REPEL = 0.005
+    K_FLOW = 0.005
     
     # --- PBT Hyperparameters ---
     PBT_BASE_WEIGHTS = jnp.array([
@@ -155,7 +159,7 @@ def symlog(x):
 # ==============================================================================
 # 2. MODEL DEFINITION
 # ==============================================================================
-def actor_critic_fn(combined_state, action_noise=None):
+def actor_critic_fn(combined_state, action_noise=None, SOG_v_mem=None, K_repel=0.0, tof_dists=None, K_flow=0.0):
     """
     Defines the Actor-Critic architecture over the unified state space.
     
@@ -172,7 +176,11 @@ def actor_critic_fn(combined_state, action_noise=None):
     mods, forces = policy_network_icnn(
         physical_state, 
         target_state=target_sym,
-        action_noise=action_noise
+        action_noise=action_noise,
+        SOG_v_mem=SOG_v_mem,
+        K_repel=K_repel,
+        tof_dists=tof_dists,
+        K_flow=K_flow
     )
     
     # 4. Critic evaluates the unified 12-dimensional observation
@@ -189,7 +197,7 @@ ac_model = hk.without_apply_rng(hk.transform(actor_critic_fn))
 # ==============================================================================
 # 2b. HOVER SPECIALIST MODEL (8D — matches hover_params.pkl from hornetRL)
 # ==============================================================================
-def hover_actor_fn(physical_state, action_noise=None):
+def hover_actor_fn(physical_state, action_noise=None, SOG_v_mem=None, K_repel=0.0, tof_dists=None, K_flow=0.0):
     """
     Original hornetRL actor architecture (8D physical state only).
     Matches the parameter structure of hover_params.pkl — trained by hornetRL
@@ -200,7 +208,11 @@ def hover_actor_fn(physical_state, action_noise=None):
     mods, forces = policy_network_icnn(
         physical_state,
         target_state=target_sym,
-        action_noise=action_noise
+        action_noise=action_noise,
+        SOG_v_mem=SOG_v_mem,
+        K_repel=K_repel,
+        tof_dists=tof_dists,
+        K_flow=K_flow
     )
     # Critic on 8D state (matching hover_params.pkl structure)
     value = hk.Sequential([
@@ -232,6 +244,9 @@ def run_visualization(env, params, update_idx, vis_step_fn):
         'heading': [],    # sensor heading (rad) per frame
         'events': [],     # (256,) 1D event camera frames
         'active_places': [], # active place cell indices per frame
+        'alpha': [],
+        'f_repel': [],
+        'flow_corr': [],
     }
     
     CANN_DT = 0.02
@@ -239,6 +254,7 @@ def run_visualization(env, params, update_idx, vis_step_fn):
     slam_time_acc = 0.0
     ev_acc = np.zeros(256, dtype=np.float32)
     kin_acc = np.zeros(3, dtype=np.float32)
+    acc_acc = np.zeros(2, dtype=np.float32)
     kin_count = 0
     
     last_slam_est_u = 0.0
@@ -246,6 +262,8 @@ def run_visualization(env, params, update_idx, vis_step_fn):
     last_slam_est_th = 0.0
     last_active_places = np.array([], dtype=np.int32)
     last_slam_surprise = 0.0
+    slam_vis_csnn_jax = jnp.zeros((1, 256))
+    slam_vis_stdp_jax = jnp.zeros((1, 256))
     
     rng = jax.random.PRNGKey(update_idx)
     state = env.reset(rng, 1) 
@@ -319,11 +337,10 @@ def run_visualization(env, params, update_idx, vis_step_fn):
                 break
             
             slam_pose_jax = jnp.array([[slam_est_u, slam_est_v, slam_est_th]])
-            # Ensure step_idx is always above the warmup threshold so the physics
-            # engine never pins velocities to zero (mirrors training's phys_indices).
             vis_step_idx = current_step_counter + Config.WARMUP_STEPS + 5
-            state, f_nodal, w_pose, h_marker = vis_step_fn(
-                env, state, params_single, vis_step_idx, jnp.array([last_slam_surprise]), hover_params_single, slam_pose_jax
+            vis_target_xy = jnp.array([[0.5, -0.5]])  # target waypoint for visualization
+            state, f_nodal, w_pose, h_marker, alpha_floored_jax, f_repel_scaled_jax, flow_corr_jax = vis_step_fn(
+                env, state, params_single, vis_step_idx, jnp.array([last_slam_surprise]), hover_params_single, slam_pose_jax, slam_vis_csnn_jax, slam_vis_stdp_jax, _sog_state.v_mem, Config.K_REPEL, Config.K_FLOW, vis_target_xy
             )
             current_step_counter += 1
 
@@ -364,13 +381,14 @@ def run_visualization(env, params, update_idx, vis_step_fn):
         sim_data['heading'].append(sensor_heading)
 
         # SLAM tracking for visualization
-        ev_jax, kin_jax, tof_jax, slam_prev_int = env.compute_slam_sensors(
+        ev_jax, kin_jax, tof_jax, acc_jax, slam_prev_int = env.compute_slam_sensors(
             r_state_np, slam_prev_int, dt=physics_dt
         )
         
         # Accumulate high-frequency events and kinematics for the 50Hz CANN SLAM
         ev_acc += np.array(ev_jax[0])
         kin_acc += np.array(kin_jax[0])
+        acc_acc += np.array(acc_jax[0])
         kin_count += 1
         
         # Dead-reckoning position integrator (high frequency)
@@ -406,12 +424,14 @@ def run_visualization(env, params, update_idx, vis_step_fn):
             # Still run the CANN pipeline for place cell mapping at 50Hz (bio-faithful)
             avg_kin = kin_acc / max(1, kin_count)
             avg_ev = np.clip(ev_acc, -1.0, 1.0)
+            avg_acc = acc_acc / max(1, kin_count)
             elapsed_time = 10 * physics_dt
             
             try:
                 scale_factor = elapsed_time / CANN_DT
                 pose_est, _, _, _, _, debug_gates = vis_slam.forward_step(
                     jnp.array([avg_ev]), jnp.array([avg_kin * scale_factor]), tof_jax,
+                    acc_t=jnp.array([avg_acc]),
                     inject_drift=False, autopilot_on=(last_slam_surprise < 0.60)
                 )
                 print(f"  [CANN UPDATE Step {i}] avg_kin (scaled): {avg_kin * scale_factor} | pose_est: {pose_est[0]}")
@@ -421,6 +441,9 @@ def run_visualization(env, params, update_idx, vis_step_fn):
                 last_slam_est_u = float(pose_est[0, 0])
                 last_slam_est_v = float(pose_est[0, 1])
                 last_slam_est_th = float(pose_est[0, 2])
+                
+                slam_vis_csnn_jax = jnp.array(debug_gates['Debug_Input_CSNN'])
+                slam_vis_stdp_jax = jnp.array(debug_gates['Debug_Input_STDP'])
                 
                 I_place_np = np.array(debug_gates['Debug_I_Place'][0])
                 max_val = np.max(I_place_np)
@@ -434,6 +457,7 @@ def run_visualization(env, params, update_idx, vis_step_fn):
             # Reset accumulators
             ev_acc = np.zeros(256, dtype=np.float32)
             kin_acc = np.zeros(3, dtype=np.float32)
+            acc_acc = np.zeros(2, dtype=np.float32)
             kin_count = 0
 
         print(f"[VIS FRAME {i:03d}] GT: ({slam_u:.3f}, {slam_v:.3f}) | SLAM: ({slam_est_u:.3f}, {slam_est_v:.3f}) | Surprise: {last_slam_surprise:.3f}")
@@ -442,6 +466,9 @@ def run_visualization(env, params, update_idx, vis_step_fn):
         sim_data['slam_est'].append((slam_est_u, slam_est_v, slam_est_th))
         sim_data['surprise'].append(last_slam_surprise)
         sim_data['events'].append(np.array(ev_jax[0])) # store raw high-freq events for visualization
+        sim_data['alpha'].append(float(alpha_floored_jax.squeeze()))
+        sim_data['f_repel'].append(float(jnp.linalg.norm(f_repel_scaled_jax.squeeze())))
+        sim_data['flow_corr'].append(float(flow_corr_jax.squeeze()))
 
         # Real SOG update: ray-cast ToF beams, excite hits, inhibit free space
         tof_d = sim_data['tof'][-1]
@@ -466,34 +493,44 @@ def run_visualization(env, params, update_idx, vis_step_fn):
     sim_data['sog_grid_w'] = _sog.grid_w
 
     # -----------------------------------------------------------------------
-    # Matplotlib Animation — three-panel layout
-    # Left:  10m×10m navigation room (SLAM space) with obstacles + trajectory
-    # Center: Topological Map (Place cells + edges)
-    # Right: close-up wing mechanics (as before)
+    # Matplotlib Animation — 2x3 Scientific Dashboard Grid
+    # Col 0 (Rows 0-1): Navigation Room (ax_nav)
+    # Col 1 (Row 0):    SOG Heatmap (ax_map)
+    # Col 2 (Row 0):    Wing Mechanics (ax_wing)
+    # Col 1 (Row 1):    Place Cell Spikes Raster (ax_snn)
+    # Col 2 (Row 1):    Dual-Axis Telemetry Chart (ax_telemetry)
     # -----------------------------------------------------------------------
-    fig, (ax_nav, ax_map, ax_wing) = plt.subplots(1, 3, figsize=(21, 7))
+    fig = plt.figure(figsize=(22, 11))
     fig.patch.set_facecolor('#0d0d0d')
-    for ax in (ax_nav, ax_map, ax_wing):
+    gs = fig.add_gridspec(2, 3, height_ratios=[1.7, 1.0], width_ratios=[1.2, 1.0, 1.0])
+    
+    ax_nav = fig.add_subplot(gs[:, 0])
+    ax_map = fig.add_subplot(gs[0, 1])
+    ax_wing = fig.add_subplot(gs[0, 2])
+    ax_snn = fig.add_subplot(gs[1, 1])
+    ax_telemetry = fig.add_subplot(gs[1, 2])
+    
+    for ax in (ax_nav, ax_map, ax_wing, ax_snn, ax_telemetry):
         ax.set_facecolor('#111111')
-        ax.tick_params(colors='#aaaaaa')
+        ax.tick_params(colors='#aaaaaa', labelsize=8)
         for spine in ax.spines.values():
             spine.set_edgecolor('#444444')
 
-    # --- Left panel: navigation room ---
+    # --- Navigation Room ---
     ax_nav.set_xlim(0, 2)
     ax_nav.set_ylim(0, 2)
     ax_nav.set_aspect('equal')
-    ax_nav.set_title('Navigation Room (SLAM Space)', color='white', fontsize=10)
-    ax_nav.set_xlabel('X (m)', color='#aaaaaa')
-    ax_nav.set_ylabel('Y (m)', color='#aaaaaa')
+    ax_nav.set_title('Navigation Room (SLAM Space)', color='white', fontsize=10, fontweight='bold')
+    ax_nav.set_xlabel('X (m)', color='#aaaaaa', fontsize=8)
+    ax_nav.set_ylabel('Y (m)', color='#aaaaaa', fontsize=8)
 
     # Draw room boundary
     room_rect = plt.Rectangle((0, 0), 2, 2, linewidth=2, edgecolor='#00ffcc', facecolor='none')
     ax_nav.add_patch(room_rect)
 
-    # --- Draw obstacles as dynamic patches (re-colored on collision) ---
+    # Draw obstacles as dynamic patches (re-colored on collision)
     obstacles_np = np.array(env._obstacles) if env._obstacles is not None else np.zeros((0, 4))
-    obs_patch_list = []  # list of (obs_bbox, patch) for collision highlighting
+    obs_patch_list = []
     for obs in obstacles_np:
         x0, y0, x1, y1 = obs
         p = plt.Rectangle((x0, y0), x1 - x0, y1 - y0,
@@ -501,16 +538,16 @@ def run_visualization(env, params, update_idx, vis_step_fn):
         ax_nav.add_patch(p)
         obs_patch_list.append((obs, p))
 
-    # Draw target in SLAM coords
-    target_phys = np.array(Config.TARGET_STATE)
-    _slam_scale  = env._slam_scale
+    # Draw target in SLAM coords (using off-center target node [0.5, -0.5])
+    target_phys = np.array([0.5, -0.5])
+    _slam_scale = env._slam_scale
     _slam_offset = 1.0
     tgt_u = target_phys[0] * _slam_scale + _slam_offset
     tgt_v = target_phys[1] * _slam_scale + _slam_offset
     ax_nav.plot(tgt_u, tgt_v, marker='*', markersize=14, color='#ffdd00',
                 markeredgecolor='#ff8800', zorder=20, label='Target')
 
-    # --- Trajectory + hornet + heading/velocity arrows (animated) ---
+    # Trajectory + artists
     traj_line, = ax_nav.plot([], [], '-', color='#00ff88', linewidth=1.0, alpha=0.6, zorder=5, label='Path (GT)')
     hornet_dot, = ax_nav.plot([], [], 'o', color='#ff4444', markersize=7, zorder=15, label='Hornet (GT)')
     slam_est_line, = ax_nav.plot([], [], ':', color='#ffa500', linewidth=1.2, alpha=0.8, zorder=6, label='Path (SLAM)')
@@ -521,41 +558,7 @@ def run_visualization(env, params, update_idx, vis_step_fn):
     slam_heading_arr = ax_nav.quiver([0], [0], [0], [0], color='#ffa500', scale=1.0, scale_units='xy', width=0.006, headwidth=4, headlength=5, zorder=15, label='SLAM Heading')
     vel_arr = ax_nav.quiver([0], [0], [0], [0], color='#ff33ff', scale=1.0, scale_units='xy', width=0.006, headwidth=4, headlength=5, zorder=16, label='Velocity')
 
-    # --- Center panel: Spiking Occupancy Grid (Robot Memory) ---
-    ax_map.set_aspect('equal')
-    ax_map.set_title('Spiking Occupancy Grid (Robot Memory)', color='white', fontsize=10)
-    ax_map.set_xlabel('X (m)', color='#aaaaaa')
-    ax_map.set_ylabel('Y (m)', color='#aaaaaa')
-
-    # Initialize SOG heatmap (replayed from pre-computed LIF v_mem snapshots)
-    # extent=[left, right, bottom, top] maps grid indices to physical coords (0-2m)
-    SOG_EXTENT = [0, 2, 0, 2]
-    _grid_n = sim_data.get('sog_grid_w', 50)
-    occ_display = np.zeros((_grid_n, _grid_n), dtype=np.float32)
-    occ_img = ax_map.imshow(
-        occ_display, origin='lower', extent=SOG_EXTENT,
-        cmap='magma', vmin=-0.2, vmax=1.0, aspect='equal', zorder=1,
-    )
-    # Robot position marker on the map
-    map_robot_dot, = ax_map.plot([], [], 'o', color='#00ffcc', markersize=5, zorder=10, label='Robot')
-    map_trail_line, = ax_map.plot([], [], '-', color='#00ffcc', linewidth=0.8, alpha=0.4, zorder=5, label='Trail')
-
-    # --- 3 ToF beam artists on SOG map (Robot Memory / CANN belief space) ---
-    _beam_colours = ['#00aaff', '#ffff44', '#00aaff']
-    map_tof_beam_artists = []
-    for _bc in _beam_colours:
-        # We use thinner, slightly translucent lines to avoid cluttering the heatmap
-        _bl, = ax_map.plot([], [], '-',  color=_bc, linewidth=1.2, alpha=0.6, zorder=12)
-        _bm, = ax_map.plot([], [], 'D',  color=_bc, markersize=3,  alpha=0.7, zorder=13)
-        map_tof_beam_artists.append((_bl, _bm))
-
-    # --- Camera FOV boundary dashes on SOG map ---
-    map_fov_left_line,  = ax_map.plot([], [], '--', color='#ffff88', linewidth=0.6, alpha=0.3, zorder=3)
-    map_fov_right_line, = ax_map.plot([], [], '--', color='#ffff88', linewidth=0.6, alpha=0.3, zorder=3)
-
-    ax_map.legend(loc='lower right', facecolor='#222222', labelcolor='white', fontsize=8)
-
-    # --- 3 ToF beam artists: [left, center, right] ---
+    # 3 ToF beam artists
     _beam_colours = ['#00aaff', '#ffff44', '#00aaff']
     tof_beam_artists = []
     for _bc in _beam_colours:
@@ -563,7 +566,7 @@ def run_visualization(env, params, update_idx, vis_step_fn):
         _bm, = ax_nav.plot([], [], 'D',  color=_bc, markersize=4,  alpha=0.95, zorder=13)
         tof_beam_artists.append((_bl, _bm))
 
-    # --- Camera FOV boundary dashes ---
+    # Camera FOV boundary dashes
     fov_left_line,  = ax_nav.plot([], [], '--', color='#ffff88', linewidth=0.8, alpha=0.4, zorder=3)
     fov_right_line, = ax_nav.plot([], [], '--', color='#ffff88', linewidth=0.8, alpha=0.4, zorder=3)
 
@@ -571,31 +574,55 @@ def run_visualization(env, params, update_idx, vis_step_fn):
                            color='#cccccc', fontsize=8, va='top', family='monospace')
     ax_nav.legend(loc='lower right', facecolor='#222222', labelcolor='white', fontsize=8)
 
-    # --- 1D Event Camera Vision Strip (Inset axis at the top of the nav view) ---
+    # 1D Event Camera Vision Strip (Inset axis at the top of the nav view)
     from matplotlib.colors import LinearSegmentedColormap
-    ax_vis = ax_nav.inset_axes([0.05, 0.88, 0.9, 0.03])
+    ax_vis = ax_nav.inset_axes([0.05, 0.91, 0.9, 0.025])
     ax_vis.set_xticks([])
     ax_vis.set_yticks([])
     for spine in ax_vis.spines.values():
         spine.set_edgecolor('#444444')
     ax_vis.set_title('1D Event Camera Stream (Green=ON, Red=OFF)', color='#888888', fontsize=6, pad=1)
     
-    colors_ev = [(0.8, 0.1, 0.1), (0.1, 0.1, 0.1), (0.1, 0.8, 0.1)]  # OFF event, no event, ON event
+    colors_ev = [(0.8, 0.1, 0.1), (0.1, 0.1, 0.1), (0.1, 0.8, 0.1)]
     cm_ev = LinearSegmentedColormap.from_list('events_cmap', colors_ev, N=3)
     vis_strip = ax_vis.imshow(np.zeros((1, N_PIXELS)), cmap=cm_ev, vmin=-1.0, vmax=1.0, aspect='auto')
 
-    # --- Right panel: close-up wing mechanics (unchanged logic) ---
+    # --- SOG Heatmap (Robot Memory) ---
+    ax_map.set_aspect('equal')
+    ax_map.set_title('Spiking Occupancy Grid (Robot Memory)', color='white', fontsize=10, fontweight='bold')
+    ax_map.set_xlabel('X (m)', color='#aaaaaa', fontsize=8)
+    ax_map.set_ylabel('Y (m)', color='#aaaaaa', fontsize=8)
+
+    SOG_EXTENT = [0, 2, 0, 2]
+    _grid_n = sim_data.get('sog_grid_w', 50)
+    occ_display = np.zeros((_grid_n, _grid_n), dtype=np.float32)
+    occ_img = ax_map.imshow(
+        occ_display, origin='lower', extent=SOG_EXTENT,
+        cmap='magma', vmin=-0.2, vmax=1.0, aspect='equal', zorder=1,
+    )
+    map_robot_dot, = ax_map.plot([], [], 'o', color='#00ffcc', markersize=5, zorder=10, label='Robot')
+    map_trail_line, = ax_map.plot([], [], '-', color='#00ffcc', linewidth=0.8, alpha=0.4, zorder=5, label='Trail')
+
+    map_tof_beam_artists = []
+    for _bc in _beam_colours:
+        _bl, = ax_map.plot([], [], '-',  color=_bc, linewidth=1.2, alpha=0.6, zorder=12)
+        _bm, = ax_map.plot([], [], 'D',  color=_bc, markersize=3,  alpha=0.7, zorder=13)
+        map_tof_beam_artists.append((_bl, _bm))
+
+    map_fov_left_line,  = ax_map.plot([], [], '--', color='#ffff88', linewidth=0.6, alpha=0.3, zorder=3)
+    map_fov_right_line, = ax_map.plot([], [], '--', color='#ffff88', linewidth=0.6, alpha=0.3, zorder=3)
+    ax_map.legend(loc='lower right', facecolor='#222222', labelcolor='white', fontsize=8)
+
+    # --- Wing Mechanics ---
     ax_wing.set_aspect('equal')
-    ax_wing.set_title('Wing Mechanics (Close-up)', color='white', fontsize=10)
-    ax_wing.set_xlabel('X (m)', color='#aaaaaa')
-    ax_wing.set_ylabel('Z (m)', color='#aaaaaa')
+    ax_wing.set_title('Wing Mechanics (Close-up)', color='white', fontsize=10, fontweight='bold')
+    ax_wing.set_xlabel('X (m)', color='#aaaaaa', fontsize=8)
+    ax_wing.set_ylabel('Z (m)', color='#aaaaaa', fontsize=8)
     ax_wing.grid(True, linestyle=':', alpha=0.2, color='#444444')
 
-    # Draw physical room boundaries (±1.0m)
     room_rect_wing = plt.Rectangle((-1.0, -1.0), 2.0, 2.0, linewidth=2, edgecolor='#00ffcc', facecolor='none', linestyle='--', zorder=2)
     ax_wing.add_patch(room_rect_wing)
 
-    # Draw physical obstacles (converted from SLAM [0,2]m by subtracting 1.0)
     obs_patch_wing_list = []
     for obs in obstacles_np:
         px0, py0, px1, py1 = obs - 1.0
@@ -625,8 +652,52 @@ def run_visualization(env, params, update_idx, vis_step_fn):
                              scale=3.0, scale_units='xy', zorder=20, width=0.0002)
     time_text = ax_wing.text(0.02, 0.95, '', transform=ax_wing.transAxes, color='#cccccc', fontsize=8)
 
-    # SOG animation: replay pre-computed v_mem snapshots
-    _sog_grid_w = sim_data.get('sog_grid_w', 50)
+    # --- Place Cell Spike Raster ---
+    spike_t = []
+    spike_idx = []
+    for f, active in enumerate(sim_data['active_places']):
+        t_val = sim_data['t'][f]
+        for neuron_id in active:
+            spike_t.append(t_val)
+            spike_idx.append(neuron_id)
+
+    ax_snn.scatter(spike_t, spike_idx, s=2, color='#00ffff', alpha=0.4, label='Place Cell Spikes')
+    ax_snn.set_xlim(0, sim_data['t'][-1] if sim_data['t'] else 1.0)
+    ax_snn.set_ylim(-5, 260)
+    ax_snn.set_title('Place Cell Spike Raster', color='white', fontsize=10, fontweight='bold')
+    ax_snn.set_xlabel('Time (s)', color='#aaaaaa', fontsize=8)
+    ax_snn.set_ylabel('Neuron ID (0-255)', color='#aaaaaa', fontsize=8)
+    ax_snn.grid(True, linestyle=':', alpha=0.2, color='#444444')
+    snn_time_line = ax_snn.axvline(x=0, color='#ff3333', linestyle='--', linewidth=1.0, alpha=0.8)
+
+    # --- Closed-Loop Telemetry Chart ---
+    time_series = sim_data['t']
+    line_surprise, = ax_telemetry.plot(time_series, sim_data['surprise'], '-', color='#ffa500', linewidth=1.2, label='SLAM Surprise')
+    line_alpha, = ax_telemetry.plot(time_series, sim_data['alpha'], '-', color='#00ffff', linewidth=1.2, label='DNAG Alpha (Gate)')
+    
+    ax_telemetry.set_xlim(0, time_series[-1] if time_series else 1.0)
+    ax_telemetry.set_ylim(-0.05, 1.1)
+    ax_telemetry.set_title('Closed-Loop Telemetry', color='white', fontsize=10, fontweight='bold')
+    ax_telemetry.set_xlabel('Time (s)', color='#aaaaaa', fontsize=8)
+    ax_telemetry.set_ylabel('Surprise / Alpha', color='#cccccc', fontsize=8)
+    ax_telemetry.grid(True, linestyle=':', alpha=0.2, color='#444444')
+
+    ax_telemetry_right = ax_telemetry.twinx()
+    ax_telemetry_right.set_facecolor('none')
+    ax_telemetry_right.tick_params(colors='#aaaaaa', labelsize=8)
+    for spine in ax_telemetry_right.spines.values():
+        spine.set_edgecolor('#444444')
+        
+    line_repel, = ax_telemetry_right.plot(time_series, sim_data['f_repel'], '-', color='#ff33ff', linewidth=1.2, label='SOG Repulsion')
+    max_repel = max(sim_data['f_repel']) if sim_data['f_repel'] else 1.0
+    ax_telemetry_right.set_ylim(-0.05 * max_repel, max_repel * 1.1 + 1e-3)
+    ax_telemetry_right.set_ylabel('SOG Repulsion (N)', color='#ff33ff', fontsize=8)
+
+    lines = [line_surprise, line_alpha, line_repel]
+    labels = [l.get_label() for l in lines]
+    ax_telemetry.legend(lines, labels, loc='upper left', facecolor='#222222', labelcolor='white', fontsize=7)
+    
+    telemetry_time_line = ax_telemetry.axvline(x=0, color='#ff3333', linestyle='--', linewidth=1.0, alpha=0.8)
 
     def update(frame):
         if frame >= len(sim_data['states']): return
@@ -670,8 +741,8 @@ def run_visualization(env, params, update_idx, vis_step_fn):
 
             # === SLAM sensor layer ===
             if frame < len(sim_data['tof']):
-                tof_d = sim_data['tof'][frame]      # (3,) SLAM distances
-                hdg   = sim_data['heading'][frame]  # theta (rad)
+                tof_d = sim_data['tof'][frame]
+                hdg   = sim_data['heading'][frame]
                 cu, cv = xs[-1], ys[-1]
 
                 # Update heading arrow pointing in sensor heading
@@ -681,18 +752,15 @@ def run_visualization(env, params, update_idx, vis_step_fn):
                 # Update velocity arrow in SLAM coordinates
                 vx_phys = r_state[4]
                 vz_phys = r_state[5]
-                vx_slam = vx_phys * env._slam_scale  # slam_scale=1.0, identity
+                vx_slam = vx_phys * env._slam_scale
                 vy_slam = vz_phys * env._slam_scale
                 vel_arr.set_offsets([[cu, cv]])
                 vel_arr.set_UVC([0.2 * vx_slam], [0.2 * vy_slam])
 
-                # --- Update Occupancy Grid (Center Panel) — replay SOG v_mem ---
+                # --- Update Occupancy Grid — replay SOG v_mem ---
                 if frame < len(sim_data['sog_states']) and frame < len(sim_data['slam_est']):
                     est_u, est_v, est_th = sim_data['slam_est'][frame]
-                    v_mem = sim_data['sog_states'][frame]  # (grid_w, grid_h) float32
-                    # v_mem axes: [x, y]. imshow expects [row=y, col=x], so transpose.
-                    # Fixed clim: v_mem is clamped at v_max=1.0 (spike threshold);
-                    # free space is inhibited to ~-0.2; walls/obstacles saturate at 1.0.
+                    v_mem = sim_data['sog_states'][frame]
                     occ_img.set_data(v_mem.T)
                     occ_img.set_clim(vmin=-0.2, vmax=1.0)
 
@@ -704,7 +772,7 @@ def run_visualization(env, params, update_idx, vis_step_fn):
                         [p[1] for p in trail_pts],
                     )
 
-                    # Update ToF beams on SOG map (hinged to CANN/observer belief)
+                    # Update ToF beams on SOG map
                     for bi, ((bl, bm), offset) in enumerate(
                             zip(map_tof_beam_artists, [-np.pi/4, 0.0, np.pi/4])):
                         ang = est_th + offset
@@ -713,7 +781,7 @@ def run_visualization(env, params, update_idx, vis_step_fn):
                         bl.set_data([est_u, hu], [est_v, hv])
                         bm.set_data([hu], [hv])
 
-                    # Update FOV boundary on SOG map (hinged to CANN/observer belief)
+                    # Update FOV boundary on SOG map
                     fov_r = 1.2
                     map_fov_left_line.set_data(
                         [est_u, est_u + fov_r * np.cos(est_th - np.pi/4)],
@@ -732,7 +800,7 @@ def run_visualization(env, params, update_idx, vis_step_fn):
                     bm.set_data([hu], [hv])
 
                 # FOV boundary (90° camera cone)
-                fov_r = 1.2  # display range (physical m = SLAM m)
+                fov_r = 1.2
                 fov_left_line.set_data(
                     [cu, cu + fov_r * np.cos(hdg - np.pi/4)],
                     [cv, cv + fov_r * np.sin(hdg - np.pi/4)])
@@ -754,8 +822,9 @@ def run_visualization(env, params, update_idx, vis_step_fn):
 
                 # SLAM text overlay
                 surprise_val = sim_data['surprise'][frame] if frame < len(sim_data['surprise']) else 0.0
+                alpha_val = sim_data['alpha'][frame] if frame < len(sim_data['alpha']) else 0.0
                 nav_time.set_text(
-                    f'θ={hdg:.2f}r | ToF [{tof_d[0]:.1f}│{tof_d[1]:.1f}│{tof_d[2]:.1f}]m | Surprise={surprise_val:.2f}'
+                    f'θ={hdg:.2f}r | ToF [{tof_d[0]:.1f}│{tof_d[1]:.1f}│{tof_d[2]:.1f}]m | Surprise={surprise_val:.2f} | α={alpha_val:.2f}'
                 )
             else:
                 nav_time.set_text(f'T={t:.3f}s')
@@ -797,7 +866,13 @@ def run_visualization(env, params, update_idx, vis_step_fn):
         quiver.set_UVC(f_nodal[:, 0], f_nodal[:, 1])
         time_text.set_text(f'T={t:.4f}s | Z={rz:.3f}m')
 
-        return patch_thorax, patch_le, patch_hinge, traj_line, hornet_dot, slam_est_line, slam_est_dot, imu_dr_line, imu_dr_dot, heading_arr, slam_heading_arr
+        # -- time indicator lines --
+        snn_time_line.set_xdata([t])
+        telemetry_time_line.set_xdata([t])
+
+        return (patch_thorax, patch_le, patch_hinge, traj_line, hornet_dot, slam_est_line,
+                slam_est_dot, imu_dr_line, imu_dr_dot, heading_arr, slam_heading_arr,
+                snn_time_line, telemetry_time_line)
 
     plt.tight_layout()
     ani = animation.FuncAnimation(fig, update, frames=len(sim_data['states']), interval=20, blit=False)
@@ -935,14 +1010,21 @@ def train():
         print("--> [HOVER] hover_params.pkl not found — using velocity-zeroed policy fallback.")
 
     # Batched hover network (vmapped over 32-agent PBT population)
-    batched_hover_network = jax.vmap(hover_ac_model.apply)
+    batched_hover_network = jax.vmap(
+        hover_ac_model.apply,
+        in_axes=(0, 0, 0, None, None, 0, None)
+    )
 
     # Validate hover specialist with a dry-run forward pass before JIT
     if _use_hover_specialist:
         try:
             _dummy_8d   = jnp.zeros((_hover_batch, 8))
             _dummy_act  = jnp.zeros((_hover_batch, 4))
-            _test_mods, _, _ = batched_hover_network(hover_fixed_params, _dummy_8d, _dummy_act)
+            _dummy_sog  = jnp.zeros((50, 50))
+            _dummy_tof  = jnp.zeros((_hover_batch, 3))
+            _test_mods, _, _ = batched_hover_network(
+                hover_fixed_params, _dummy_8d, _dummy_act, _dummy_sog, 0.0, _dummy_tof, 0.0
+            )
             print(f"    -> Hover specialist validated: mods shape {_test_mods.shape}")
         except Exception as _e:
             print(f"    -> WARNING: hover specialist forward-pass failed ({_e})")
@@ -951,7 +1033,7 @@ def train():
             _use_hover_specialist = False
             hover_fixed_params    = None
 
-    def loss_fn(params, start_state, pbt_weights, key, slam_pose, slam_surprise, obstacles):
+    def loss_fn(params, start_state, pbt_weights, key, slam_pose, slam_surprise, obstacles, vis_csnn, vis_stdp, SOG_v_mem, target_xy):
         """
         Computes the total loss over the trajectory horizon.
         Includes policy gradient, value function loss, and auxiliary force matching loss.
@@ -959,6 +1041,7 @@ def train():
         slam_pose:     (3,) JAX array  [slam_x, slam_y, slam_heading] in 10m SLAM space.
                        Converted to hornet metres before being fed to the Instar routing.
         slam_surprise: scalar float  in [0, 1]  — 1.0 = fully novel scene, 0.0 = familiar.
+        target_xy:     (B, 2) JAX array of dynamic target physical coordinates.
         """
         rollout_indices = jnp.arange(Config.HORIZON)
         phys_indices = rollout_indices + Config.WARMUP_STEPS + 5
@@ -983,8 +1066,23 @@ def train():
             r_idx, p_idx, step_key = xs
             
             curr_robot = curr_full[0]
-            wrapped_theta = jnp.mod(curr_robot[:, 2] + jnp.pi, 2 * jnp.pi) - jnp.pi
-            obs_robot = curr_robot.at[:, 2].set(wrapped_theta)
+            start_robot = start_state[0]
+            
+            # SLAM-estimated position and heading at step t
+            disp_x = curr_robot[:, 0] - start_robot[:, 0]
+            disp_z = curr_robot[:, 1] - start_robot[:, 1]
+            disp_th = curr_robot[:, 2] - start_robot[:, 2]
+            
+            slam_x_t = slam_xy_hornet[0] + disp_x
+            slam_z_t = slam_xy_hornet[1] + disp_z
+            slam_th_t = slam_pose_hornet[2] + disp_th
+            
+            # Construct the SLAM-based observation robot state relative to the target
+            obs_robot = curr_robot
+            obs_robot = obs_robot.at[:, 0].set(slam_x_t - target_xy[:, 0])
+            obs_robot = obs_robot.at[:, 1].set(slam_z_t - target_xy[:, 1])
+            wrapped_theta = jnp.mod(slam_th_t + jnp.pi, 2 * jnp.pi) - jnp.pi
+            obs_robot = obs_robot.at[:, 2].set(wrapped_theta)
 
             scaled_obs = symlog(obs_robot)
             
@@ -1000,15 +1098,28 @@ def train():
             key_noise, key_step = jax.random.split(step_key)
             action_noise = jax.random.normal(key_noise, shape=(B, 4)) * Config.ACTION_NOISE_SIGMA
 
+            # Compute ToF distances for EMD optic flow
+            slam_u_batch = curr_robot[:, 0] * env._slam_scale + 1.0
+            slam_v_batch = curr_robot[:, 1] * env._slam_scale + 1.0
+            slam_pos_batch = jnp.stack([slam_u_batch, slam_v_batch], axis=-1)
+            sensor_heading_batch = curr_robot[:, 2] - 1.0
+            
+            tof_dists = jax.vmap(compute_tof_distance, in_axes=(0, 0, None))(
+                slam_pos_batch, sensor_heading_batch, env._segments
+            )
+
             # 3. Policy Inference
-            batched_network = jax.vmap(ac_model.apply)
-            mods, u_brain, _ = batched_network(params, combined_obs, action_noise)
+            batched_network = jax.vmap(ac_model.apply, in_axes=(0, 0, 0, None, None, 0, None))
+            mods, u_brain, _ = batched_network(
+                params, combined_obs, action_noise, SOG_v_mem, Config.K_REPEL, tof_dists, Config.K_FLOW
+            )
             
             # --- LYAPUNOV HOVER & ATTENTION GATING (DNAG) ---
             # Use real SLAM surprise (frozen for this 32-step horizon).
             # Floor with positional distance so DNAG engages even before SLAM warms up.
+            slam_pos_t = jnp.stack([slam_x_t, slam_z_t], axis=-1)
             dist_floor = jnp.clip(
-                jnp.sqrt(jnp.sum((curr_robot[:, :2] - Config.TARGET_STATE[:2])**2, axis=-1) + 1e-8) * 2.0,
+                jnp.sqrt(jnp.sum((slam_pos_t - target_xy)**2, axis=-1) + 1e-8) * 2.0,
                 0.0, 1.0
             )
             sim_surprise = jnp.maximum(frozen_surp, dist_floor)
@@ -1019,15 +1130,17 @@ def train():
             # noisy_obs is 8D (physical state only), matching the hover specialist's obs space.
             if _use_hover_specialist:
                 hover_mods, _, _ = batched_hover_network(
-                    hover_fixed_params, noisy_obs, jnp.zeros((B, 4))
+                    hover_fixed_params, noisy_obs, jnp.zeros((B, 4)), SOG_v_mem, Config.K_REPEL, tof_dists, Config.K_FLOW
                 )
             else:
                 # Fallback: velocity-zeroed policy (if hover_params.pkl was not found)
                 hover_robot   = curr_robot.at[:, 4:8].set(0.0)
                 hover_wrapped = jnp.mod(hover_robot[:, 2] + jnp.pi, 2 * jnp.pi) - jnp.pi
                 hover_obs_raw = hover_robot.at[:, 2].set(hover_wrapped)
-                hover_obs     = jnp.concatenate([symlog(hover_obs_raw), curr_weighted_belief], axis=-1)
-                hover_mods, _, _ = batched_network(params, hover_obs, jnp.zeros((B, 4)))
+                hover_obs = jnp.concatenate([symlog(hover_obs_raw), curr_weighted_belief], axis=-1)
+                hover_mods, _, _ = batched_network(
+                    params, hover_obs, jnp.zeros((B, 4)), SOG_v_mem, Config.K_REPEL, tof_dists, Config.K_FLOW
+                )
 
             # Fully differentiable attention gate blending.
             # DNAG_MIN_ALPHA enforces a hover-specialist floor: even when SLAM
@@ -1044,12 +1157,12 @@ def train():
             
             # --- PERCEPTUAL STREAM INGESTION (460 Hz Instar routing) ---
             # Use real SLAM pose + small noise as the pose_belief fed into Instar.
-            # CSNN/STDP placeholders: replaced by real SLAM visual features in a future pass.
             key_stdp, _ = jax.random.split(key_step)
-            pose_belief = frozen_pose + jax.random.normal(key_step, shape=(B, 3)) * 0.01
+            slam_pose_t = jnp.stack([slam_x_t, slam_z_t, slam_th_t], axis=-1)
+            pose_belief = slam_pose_t + jax.random.normal(key_step, shape=(B, 3)) * 0.01
 
-            norm_csnn = jnp.zeros((B, 256))  # real CSNN from SLAM debug_gates['Debug_Input_CSNN']
-            norm_stdp  = jnp.zeros((B, 256))  # real STDP from SLAM debug_gates['Debug_Input_STDP']
+            norm_csnn = jnp.broadcast_to(vis_csnn, (B, 256))
+            norm_stdp  = jnp.broadcast_to(vis_stdp, (B, 256))
             visual_features = (norm_csnn, norm_stdp)
             
             # Update Instar Weights & Project weighted belief for the next control step
@@ -1057,8 +1170,12 @@ def train():
                 next_full, pose_belief, visual_features, u_brain
             )
             
-            # 5. Reward Calculation
-            rew_scaled, met = env.get_reward_metrics(curr_robot, u_brain, pbt_weights)
+            # 5. Reward Calculation (Dynamic Waypoints)
+            target_state_batch = jnp.zeros((B, 8))
+            target_state_batch = target_state_batch.at[:, :2].set(target_xy)
+            target_state_batch = target_state_batch.at[:, 2].set(Config.TARGET_STATE[2])
+            target_state_batch = target_state_batch.at[:, 3].set(Config.TARGET_STATE[3])
+            rew_scaled, met = env.get_reward_metrics(curr_robot, u_brain, pbt_weights, target=target_state_batch)
 
             # --- OBSTACLE COLLISION PENALTY (differentiable gradient signal) ---
             # Convert physical (x, z) → SLAM space and compute signed distance to obstacles.
@@ -1169,11 +1286,11 @@ def train():
     _SLAM_OFFSET_TRAIN = 1.0  # physical: hornet ±ARENA_W → SLAM [0, 2m]
 
     @jax.jit
-    def update(params, opt_state, full_state, pbt_state, key, slam_pose, slam_surprise, obstacles):
+    def update(params, opt_state, full_state, pbt_state, key, slam_pose, slam_surprise, obstacles, vis_csnn, vis_stdp, SOG_v_mem, target_xy):
         key_loss, key_next = jax.random.split(key)
         
         (loss, (logs, next_state)), grads = jax.value_and_grad(loss_fn, has_aux=True)(
-            params, full_state, pbt_state.weights, key_loss, slam_pose, slam_surprise, obstacles
+            params, full_state, pbt_state.weights, key_loss, slam_pose, slam_surprise, obstacles, vis_csnn, vis_stdp, SOG_v_mem, target_xy
         )
         
         updates, new_opt = optimizer.update(grads, opt_state, params)
@@ -1186,9 +1303,15 @@ def train():
 
         return new_params, new_opt, loss, logs, next_state, new_pbt_state, key_next
 
+    # Initialize SOG for training tracking
+    sog_system = SpikingOccupancyGrid(map_size_m=2.0, res=0.04, offset_m=0.0, v_max=1.0)
+    sog_state = sog_system.init_state()
+
     print(f"=== Starting Training: Step {start_step} to {Config.TOTAL_UPDATES} ===")
     rng, key_reset = jax.random.split(rng)
     curr_state = env.reset(key_reset, Config.BATCH_SIZE)
+    rng, key_tgt = jax.random.split(rng)
+    target_xy = jax.random.uniform(key_tgt, (Config.BATCH_SIZE, 2), minval=-0.8, maxval=0.8)
     
     # --- Initialise SLAM System ---
     # One SNNSLAMSystem tracks agent-0's trajectory and provides real pose + surprise
@@ -1211,6 +1334,8 @@ def train():
     slam_pose     = jnp.array([init_slam_x, init_slam_z, init_slam_th])  # (3,)
     slam_surprise = 0.0                                                    # float
     slam_prev_int = np.zeros(N_PIXELS, dtype=np.float32)                  # event delta baseline
+    slam_vis_csnn = jnp.zeros(256)
+    slam_vis_stdp = jnp.zeros(256)
     print(f"    -> SLAM initialised at ({init_slam_x:.2f}, {init_slam_z:.2f}) m, sensor heading {init_slam_th:.2f} rad")
     
     # Helper: regenerate arena + reset SLAM at episode boundaries
@@ -1222,7 +1347,7 @@ def train():
         3. Clears the event-camera intensity baseline.
         Returns updated slam_pose, slam_surprise, slam_prev_int.
         """
-        nonlocal slam_prev_int
+        nonlocal slam_prev_int, slam_vis_csnn, slam_vis_stdp, sog_state
         if key is not None:
             env.regenerate_arena(key=key)
         env._prev_robot_state = None
@@ -1239,6 +1364,9 @@ def train():
             jnp.array([new_slam_th]),
         )
         slam_prev_int = np.zeros(N_PIXELS, dtype=np.float32)  # clear event baseline
+        slam_vis_csnn = jnp.zeros(256)
+        slam_vis_stdp = jnp.zeros(256)
+        sog_state = sog_system.init_state()
 
         new_slam_pose = jnp.array([new_slam_x, new_slam_z, new_slam_th])
         print(f"    ---> New arena + SLAM reset: pose ({new_slam_x:.2f}, {new_slam_z:.2f}) m, sensor heading {new_slam_th:.2f} rad")
@@ -1250,7 +1378,7 @@ def train():
         Resets and re-initialises the SLAM tracker to match the fresh spawn position,
         without regenerating the obstacle distribution of the arena.
         """
-        nonlocal slam_prev_int
+        nonlocal slam_prev_int, slam_vis_csnn, slam_vis_stdp, sog_state
         env._prev_robot_state = None
         r0 = np.array(curr_agent0_state)
         new_slam_x  = float(r0[0]) * env._slam_scale + 1.0
@@ -1263,16 +1391,20 @@ def train():
             jnp.array([new_slam_th]),
         )
         slam_prev_int = np.zeros(N_PIXELS, dtype=np.float32)
+        slam_vis_csnn = jnp.zeros(256)
+        slam_vis_stdp = jnp.zeros(256)
+        sog_state = sog_system.init_state()
 
         new_slam_pose = jnp.array([new_slam_x, new_slam_z, new_slam_th])
         print(f"    [SLAM RESET ON CRASH] Re-initialized at ({new_slam_x:.2f}, {new_slam_z:.2f}) m")
         return new_slam_pose, 0.0
 
     # --- JIT Compilation ---
-    print("---> Compiling JAX Update...")
+    print("-----> Compiling JAX Update...")
     t0 = time.time()
     key_compile = jax.random.PRNGKey(0)
-    _ = update(params, opt_state, curr_state, pbt_state, key_compile, slam_pose, jnp.array(slam_surprise), env._obstacles)
+    _dummy_sog = jnp.zeros((50, 50))
+    _ = update(params, opt_state, curr_state, pbt_state, key_compile, slam_pose, jnp.array(slam_surprise), env._obstacles, slam_vis_csnn, slam_vis_stdp, _dummy_sog, target_xy)
     print(f"---> Compilation Finished in {time.time() - t0:.2f}s")
 
     # --- Main Loop ---
@@ -1291,13 +1423,14 @@ def train():
         _prev_opt_state = opt_state
         params, opt_state, loss, logs, next_state, pbt_state, key_explore = update(
             params, opt_state, curr_state, pbt_state, key_explore,
-            slam_pose, jnp.array(slam_surprise), env._obstacles
+            slam_pose, jnp.array(slam_surprise), env._obstacles, slam_vis_csnn, slam_vis_stdp, jnp.array(sog_state.v_mem),
+            target_xy
         )
 
         # 1b. SLAM update (outside JIT, runs on agent-0's terminal state)
         # Compute sensor bundle from the final state of this horizon
         robot0_np = np.array(next_state[0][0])  # (8,) agent-0 hornet state
-        ev_jax, kin_jax, tof_jax, slam_prev_int = env.compute_slam_sensors(
+        ev_jax, kin_jax, tof_jax, acc_jax, slam_prev_int = env.compute_slam_sensors(
             robot0_np, slam_prev_int, dt=Config.HORIZON * Config.SIM_SUBSTEPS * Config.DT
         )
         # Run SLAM steps (closed-loop with full memory + loop closure detection)
@@ -1306,7 +1439,7 @@ def train():
             kin_jax_scaled = kin_jax * 1.152
             for _ in range(3):
                 pose_est, _, _, _, _, debug_gates = slam_system.forward_step(
-                    ev_jax, kin_jax_scaled, tof_jax,
+                    ev_jax, kin_jax_scaled, tof_jax, acc_t=acc_jax,
                     inject_drift=False, autopilot_on=(slam_surprise < 0.60)
                 )
             slam_pose     = jnp.array([
@@ -1315,9 +1448,25 @@ def train():
                 float(pose_est[0, 2]),   # heading
             ])
             slam_surprise = float(1.0 - float(debug_gates['Raw_Match'][0]))
+            slam_vis_csnn = jnp.array(debug_gates['Debug_Input_CSNN'][0])
+            slam_vis_stdp = jnp.array(debug_gates['Debug_Input_STDP'][0])
         except Exception as _slam_err:
             # Graceful fallback: keep previous SLAM values
             print(f"    [SLAM] non-fatal error at step {i}: {_slam_err}")
+            
+        # Update SOG for training agent-0 (outside JIT)
+        try:
+            s_u = robot0_np[0] * env._slam_scale + 1.0
+            s_v = robot0_np[1] * env._slam_scale + 1.0
+            s_th = robot0_np[2] - 1.0
+            _hit, _free = _get_ray_indices(
+                s_u, s_v, s_th,
+                np.array(tof_jax[0]), [-np.pi/4, 0.0, np.pi/4],
+                res=sog_system.res, grid_size=sog_system.grid_w, offset_m=sog_system.offset_m,
+            )
+            sog_state = sog_system.update(sog_state, jnp.array(_hit), jnp.array(_free))
+        except Exception as _sog_err:
+            print(f"    [SOG] non-fatal error at step {i}: {_sog_err}")
     
         # 2. Stability Checks
         if jnp.isnan(loss):
@@ -1356,6 +1505,11 @@ def train():
             lambda x, y: jnp.where(jnp.reshape(reset_mask, (-1,) + (1,)*(x.ndim-1)), y, x),
             next_state, fresh_state
         )
+
+        # Randomize target for crashed agents
+        rng, k_fresh_tgt = jax.random.split(rng)
+        fresh_target_xy = jax.random.uniform(k_fresh_tgt, (Config.BATCH_SIZE, 2), minval=-0.8, maxval=0.8)
+        target_xy = jnp.where(reset_mask[:, None], fresh_target_xy, target_xy)
 
         # 🌟 CRITICAL FIX: If agent 0 (tracked by SLAM) crashed and reset,
         # we must reset the SLAM tracker to match its new spawn position!
@@ -1424,6 +1578,8 @@ def train():
             slam_pose, slam_surprise = _reset_slam_for_new_arena(
                 None, curr_state[0][0]  # agent-0's new spawn state
             )
+            rng, k_tgt = jax.random.split(rng)
+            target_xy = jax.random.uniform(k_tgt, (Config.BATCH_SIZE, 2), minval=-0.8, maxval=0.8)
 
         print(f"Step {i:04d} | Epoch: {dt_epoch:.2f}s | Total: {total_elapsed/60:.1f}min | "
               f"Loss: {loss:.1e} (A:{logs['act_loss']:.1e} C:{logs['crit_loss']:.1e}) | "
@@ -1446,22 +1602,26 @@ def train():
 
 # Global Visualization Step
 @partial(jax.jit, static_argnums=(0,))
-def vis_step_fn(env, curr_state, curr_params, step_idx, slam_surprise, hover_params_single, slam_pose):
+def vis_step_fn(env, curr_state, curr_params, step_idx, slam_surprise, hover_params_single, slam_pose, vis_csnn, vis_stdp, SOG_v_mem, K_repel, K_flow, target_xy):
     r_st = curr_state[0]
     B = r_st.shape[0]
     
-    # 1. Prepare Observation
-    wrapped_th = jnp.mod(r_st[:, 2] + jnp.pi, 2 * jnp.pi) - jnp.pi
-    obs_v = r_st.at[:, 2].set(wrapped_th)
-    scaled_obs = symlog(obs_v)
-    
-    # 2. Ingest visual-spatial belief features
     # Convert SLAM pose from physical SLAM space → hornet physical metres for Instar routing
     slam_xy_hornet = (slam_pose[:, :2] - 1.0) / env._slam_scale
     pose_belief = jnp.concatenate([slam_xy_hornet, slam_pose[:, 2:3]], axis=-1)
     
-    norm_csnn = jnp.zeros((B, 256)).at[:, 0].set(1.0)
-    norm_stdp = jnp.zeros((B, 256)).at[:, 0].set(1.0)
+    # 1. Prepare Observation using SLAM-estimated position and heading relative to the target
+    obs_v = r_st
+    obs_v = obs_v.at[:, 0].set(pose_belief[:, 0] - target_xy[:, 0])
+    obs_v = obs_v.at[:, 1].set(pose_belief[:, 1] - target_xy[:, 1])
+    obs_v = obs_v.at[:, 2].set(pose_belief[:, 2])
+    wrapped_th = jnp.mod(obs_v[:, 2] + jnp.pi, 2 * jnp.pi) - jnp.pi
+    obs_v = obs_v.at[:, 2].set(wrapped_th)
+    scaled_obs = symlog(obs_v)
+    
+    # 2. Ingest visual-spatial belief features
+    norm_csnn = vis_csnn
+    norm_stdp = vis_stdp
     visual_features = (norm_csnn, norm_stdp)
     
     next_state, weighted_belief = env.ingest_perceptual_streams(
@@ -1470,25 +1630,41 @@ def vis_step_fn(env, curr_state, curr_params, step_idx, slam_surprise, hover_par
     
     combined_obs = jnp.concatenate([scaled_obs, weighted_belief], axis=-1)
     
+    # Compute ToF distances for EMD optic flow
+    slam_u_batch = r_st[:, 0] * env._slam_scale + 1.0
+    slam_v_batch = r_st[:, 1] * env._slam_scale + 1.0
+    slam_pos_batch = jnp.stack([slam_u_batch, slam_v_batch], axis=-1)
+    sensor_heading_batch = r_st[:, 2] - 1.0
+    
+    tof_dists = jax.vmap(compute_tof_distance, in_axes=(0, 0, None))(
+        slam_pos_batch, sensor_heading_batch, env._segments
+    )
+
     # 3. Policy Inference
-    mods, _, _ = ac_model.apply(curr_params, combined_obs)
+    mods, _, _ = ac_model.apply(
+        curr_params, combined_obs, None, SOG_v_mem, K_repel, tof_dists, K_flow
+    )
     
     # --- LYAPUNOV HOVER & ATTENTION GATING (DNAG) ---
     dist_floor = jnp.clip(
-        jnp.sqrt(jnp.sum((r_st[:, :2] - Config.TARGET_STATE[:2])**2, axis=-1) + 1e-8) * 2.0,
+        jnp.sqrt(jnp.sum((r_st[:, :2] - target_xy)**2, axis=-1) + 1e-8) * 2.0,
         0.0, 1.0
     )
     sim_surprise = jnp.maximum(slam_surprise, dist_floor)
     
     if hover_params_single is not None:
-        hover_mods, _, _ = hover_ac_model.apply(hover_params_single, scaled_obs)
+        hover_mods, _, _ = hover_ac_model.apply(
+            hover_params_single, scaled_obs, None, SOG_v_mem, K_repel, tof_dists, K_flow
+        )
     else:
         # Fallback: velocity-zeroed policy
         hover_robot = r_st.at[:, 4:8].set(0.0)
         hover_wrapped = jnp.mod(hover_robot[:, 2] + jnp.pi, 2 * jnp.pi) - jnp.pi
         hover_obs_raw = hover_robot.at[:, 2].set(hover_wrapped)
         hover_obs = jnp.concatenate([symlog(hover_obs_raw), weighted_belief], axis=-1)
-        hover_mods, _, _ = ac_model.apply(curr_params, hover_obs)
+        hover_mods, _, _ = ac_model.apply(
+            curr_params, hover_obs, None, SOG_v_mem, K_repel, tof_dists, K_flow
+        )
         
     blended_mods, alpha = jax.vmap(differentiable_attention_gate)(sim_surprise, mods, hover_mods)
     alpha_floored = jnp.maximum(alpha, Config.DNAG_MIN_ALPHA)
@@ -1497,7 +1673,16 @@ def vis_step_fn(env, curr_state, curr_params, step_idx, slam_surprise, hover_par
     # 4. Env Step
     next_state, _, f_nodal, w_pose, h_marker = env.step_batch(next_state, blended_mods, step_idx=step_idx)
     
-    return next_state, f_nodal, w_pose, h_marker
+    # Compute SOG repulsive force
+    robot_pos_slam = scaled_obs[:, :2] + 1.0
+    f_repel = compute_sog_repulsive_force(robot_pos_slam, SOG_v_mem)
+    f_repel_scaled = K_repel * f_repel
+    
+    # Compute EMD optic flow bias
+    delta_proximity = 1.0 / (tof_dists[..., 0] + 1e-3) - 1.0 / (tof_dists[..., 2] + 1e-3)
+    flow_corr = K_flow * delta_proximity
+    
+    return next_state, f_nodal, w_pose, h_marker, alpha_floored, f_repel_scaled, flow_corr
 
 if __name__ == "__main__":
     import argparse
