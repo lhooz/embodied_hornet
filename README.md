@@ -134,6 +134,30 @@ All integration code lives in `embodied_hornet/` (this package). The dependency 
 
 ---
 
+## 🧠 Neuromorphic Obstacle Avoidance
+
+This project incorporates a dual-pathway, neuromorphic obstacle avoidance system inspired by biological flying insects. It combines low-latency reflexive steering with topological spatial maps to safely navigate complex environments:
+
+### Hybrid Biological Stream Architecture
+1. **The Dorsal Stream (LPTC Optic Flow Reflex):** Processes event streams from the 1D Event Camera using Elementary Motion Detectors (EMDs) to compute differential flow. Looming or visual expansion on one side triggers a direct optomotor centering response.
+2. **The Ventral Stream (Central Complex Map Navigation):** Uses the Spiking Occupancy Grid (SOG) representing local memory to construct a fully differentiable **Artificial Potential Field (APF)**. The gradient of this field is added directly to the port-Hamiltonian energy function, generating Lyapunov-stable steering forces away from obstacles.
+
+```mermaid
+graph TD
+    EventCam["1D Event Camera (256 pix)"] --> EMD["Elementary Motion Detector (Lobula Plate)"]
+    ToF["3-Beam ToF Sonar"] --> SOG["Spiking Occupancy Grid Map (LIF Sheet)"]
+    
+    EMD -->|Differential Flow| CPGSteer["CPG Steering Bias (Dorsal)"]
+    SOG -->|Repulsive potential| APF["Artificial Potential Field (Ventral)"]
+    
+    APF -->|Energy gradient| IDAPBC["Neural IDA-PBC Actor"]
+    IDAPBC --> CPG["CPG Modulator"]
+    CPGSteer --> CPG
+    CPG --> Kinematics["Wing Kinematics"]
+```
+
+---
+
 ## Dependencies
 
 | Repo | Role | Linked as |
