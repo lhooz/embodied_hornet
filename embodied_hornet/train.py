@@ -881,6 +881,10 @@ def run_visualization(env, params, update_idx, vis_step_fn):
                 snn_time_line, telemetry_time_line)
 
     plt.tight_layout()
+    if len(sim_data['states']) == 0:
+        print(f"--> Viz skipped: rollout ended before any frames were recorded.")
+        plt.close(fig)
+        return
     ani = animation.FuncAnimation(fig, update, frames=len(sim_data['states']), interval=20, blit=False)
     out_file = os.path.join(Config.VIS_DIR, f"epoch_{update_idx}.gif")
     ani.save(out_file, writer='pillow', fps=60)
@@ -1172,8 +1176,12 @@ def train():
             visual_features = (norm_csnn, norm_stdp)
             
             # Update Instar Weights & Project weighted belief for the next control step
+            # CRITICAL: Normalize u_brain from raw Newtons to [-1,1] saturated commands
+            # before feeding as the Instar Hebbian target signal.  Raw forces (e.g. 50 N)
+            # cause dW = eta*y*x ≈ 5*x per step → weight explosion → NaN in 32 steps.
+            u_brain_saturated = jnp.tanh(u_brain / Config.FORCE_NORMALIZER)
             next_full, next_weighted_belief = env.ingest_perceptual_streams(
-                next_full, pose_belief, visual_features, u_brain
+                next_full, pose_belief, visual_features, u_brain_saturated
             )
             
             # 5. Reward Calculation (Dynamic Waypoints)

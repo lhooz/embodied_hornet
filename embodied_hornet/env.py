@@ -376,9 +376,17 @@ class FlyEnv:
         dW = eta * delta_learn - lam * delta_forget
         W_instar_next = W_instar + dW
         
+        # Safety: clamp synaptic weights to prevent unbounded growth over long training.
+        # The 515-dim dot product can accumulate to extreme values if W is unconstrained.
+        W_instar_next = jnp.clip(W_instar_next, -1.0, 1.0)
+        
         # 3. Project the perceptual inputs onto the policy using the updated weights
         # Out = W^T * x
         weighted_perceptual_belief = jnp.einsum('bip,bi->bp', W_instar_next, x_perceptual)  # (B, 4)
+        
+        # Safety: clamp the projected belief to prevent extreme values feeding into the critic.
+        # With 515 inputs and weights in [-1,1], raw einsum can reach ~±500.
+        weighted_perceptual_belief = jnp.clip(weighted_perceptual_belief, -5.0, 5.0)
         
         updated_state = (robot_st, fluid_st, osc_st, active_props, W_instar_next)
         
