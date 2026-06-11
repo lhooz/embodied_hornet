@@ -434,13 +434,18 @@ def run_visualization(env, params, update_idx, vis_step_fn):
                     acc_t=jnp.array([avg_acc]),
                     inject_drift=False, autopilot_on=(last_slam_surprise < 0.60)
                 )
-                print(f"  [CANN UPDATE Step {i}] avg_kin (scaled): {avg_kin * scale_factor} | pose_est: {pose_est[0]}")
                 last_slam_surprise = float(1.0 - float(debug_gates['Raw_Match'][0]))
                 
                 # Use actual CANN SLAM output for position and heading display
                 last_slam_est_u = float(pose_est[0, 0])
                 last_slam_est_v = float(pose_est[0, 1])
                 last_slam_est_th = float(pose_est[0, 2])
+                
+                # Print professional telemetry tracking
+                est_pitch = float(pose_est[0, 2])
+                est_grav = float(vis_slam._theta_gravity[0])
+                print(f"  📊 [SLAM TELEMETRY] Step {i:03d} | Pos GT: ({slam_u:.2f}, {slam_v:.2f}) SLAM: ({last_slam_est_u:.2f}, {last_slam_est_v:.2f}) "
+                      f"| Pitch GT: {r_state_np[2]:.3f} rad, CF Grav: {est_grav:.3f} rad, CANN Head: {est_pitch:.3f} rad | Surprise: {last_slam_surprise:.3f}")
                 
                 slam_vis_csnn_jax = jnp.array(debug_gates['Debug_Input_CSNN'])
                 slam_vis_stdp_jax = jnp.array(debug_gates['Debug_Input_STDP'])
@@ -460,7 +465,8 @@ def run_visualization(env, params, update_idx, vis_step_fn):
             acc_acc = np.zeros(2, dtype=np.float32)
             kin_count = 0
 
-        print(f"[VIS FRAME {i:03d}] GT: ({slam_u:.3f}, {slam_v:.3f}) | SLAM: ({slam_est_u:.3f}, {slam_est_v:.3f}) | Surprise: {last_slam_surprise:.3f}")
+        if (i + 1) % 10 == 0 or i == 0:
+            print(f"  🎬 [VIS FRAME {i:03d}/{total_visual_frames:03d}] Rendering frame and updating physics...")
 
         sim_data['active_places'].append(last_active_places)
         sim_data['slam_est'].append((slam_est_u, slam_est_v, slam_est_th))
@@ -1581,13 +1587,10 @@ def train():
             rng, k_tgt = jax.random.split(rng)
             target_xy = jax.random.uniform(k_tgt, (Config.BATCH_SIZE, 2), minval=-0.8, maxval=0.8)
 
-        print(f"Step {i:04d} | Epoch: {dt_epoch:.2f}s | Total: {total_elapsed/60:.1f}min | "
-              f"Loss: {loss:.1e} (A:{logs['act_loss']:.1e} C:{logs['crit_loss']:.1e}) | "
-              f"Rew: {logs['rew']:.1f}\n"
-              f"    -> Errs[Pos:{logs['pos']:.2f} Th:{logs['ang_th']:.2f} Ab:{logs['ang_ab']:.2f} "
-              f"LVel:{logs['vel_lin']:.2f} AVel:{logs['vel_ang']:.2f} Frc:{logs['ferr']:.4f}] | "
-              f"MeanPos: [{mean_x:+.2f}, {mean_z:+.2f}]\n"
-              f"    -> Phys: [Hum:{raw_hum_energy:.0f} | ThVel:{thorax_mag:.2f} rad/s]")
+        print(f"⚡ [SHAC EPOCH {i:04d}] Loss: {loss:.2e} (Act: {logs['act_loss']:.1e}, Crit: {logs['crit_loss']:.1e}) | Reward: {logs['rew']:.2f} | Time: {dt_epoch:.1f}s (Total: {total_elapsed/60:.1f}m)\n"
+              f"   ├── Target Tracking Errors: Pos: {logs['pos']:.2f}m | Pitch: {logs['ang_th']:.2f} rad | Abdomen: {logs['ang_ab']:.2f} rad | MeanPos: [{mean_x:+.2f}, {mean_z:+.2f}]m\n"
+              f"   └── Biomechanics & Forces : LinVel: {logs['vel_lin']:.2f} m/s | AngVel: {logs['vel_ang']:.2f} rad/s | WingForce Err: {logs['ferr']:.3f} mN\n"
+              f"   └── Energetics & Flight   : Muscle Energy: {raw_hum_energy:.0f} J | Thorax AngVel: {thorax_mag:.2f} rad/s")
     
         if i % Config.VIS_INTERVAL == 0 or i == start_step:
             ckpt_path = os.path.join(Config.CKPT_DIR, f"shac_params_{i}.pkl")
