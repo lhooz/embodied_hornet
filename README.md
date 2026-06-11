@@ -20,17 +20,19 @@ embodied_hornet (this project — integration layer)
 ### System Flow
 
 ```
-Event Camera → [neuro-symbolic-slam] → Spatial Belief (3-DOF) + Visual Features (512-dim)
-                                              ↓
-                                    Asymmetric Instar Rule
-                                              ↓
-                          [hornetRL] ← Weighted Perceptual Belief (4-dim)
-                                              ↓
-                                    IDA-PBC + Neural CPG → Wing Kinematics
-                                              ↓
-                                    [fly_surrogate] → Aerodynamic Forces
-                                              ↓
-                                    Port-Hamiltonian Dynamics → Next State
+IMU [Acc, Gyro] → [Complementary Filter] ──┐
+                                           ↓
+Event Camera ───→ [neuro-symbolic-slam] ──→ Spatial Belief (3-DOF) + Visual Features (512-dim)
+                                                       ↓
+                                             Asymmetric Instar Rule
+                                                       ↓
+                                   [hornetRL] ← Weighted Perceptual Belief (4-dim)
+                                                       ↓
+                                             IDA-PBC + Neural CPG → Wing Kinematics
+                                                       ↓
+                                             [fly_surrogate] → Aerodynamic Forces
+                                                       ↓
+                                             Port-Hamiltonian Dynamics → Next State
 ```
 
 ---
@@ -52,7 +54,7 @@ embodied_hornet/                        <-- This repository (integration layer)
 │                                       #   logging for DNAG diagnostics
 ├── hornetRL/                           <-- git submodule (base flight control, unmodified)
 ├── fly_surrogate/                      <-- git submodule (aerodynamic physics, unmodified)
-├── neuro-symbolic-slam/                <-- git submodule (SLAM perception, unmodified)
+├── neuro-symbolic-slam/                <-- git submodule (SLAM perception, modified to add gravity fusion)
 ├── notebooks/
 │   └── demo_colab.ipynb               # Google Colab demo (see badge above)
 ├── docs/
@@ -119,14 +121,16 @@ python -m embodied_hornet.train --gpu
 
 ## Key Integration Points
 
-All integration code lives in `embodied_hornet/` (this package). The three dependency repos are used **unmodified**:
+All integration code lives in `embodied_hornet/` (this package). The dependency repos (hornetRL, fly_surrogate) are used **unmodified**, while neuro-symbolic-slam has been modified to incorporate gravity correction features:
 
 | Module | File | What it adds |
 |:---|:---|:---|
-| `env.py` | [embodied_hornet/env.py](embodied_hornet/env.py) | `FlyEnv`: 1m×1m arena geometry generation (`regenerate_arena()`), SLAM coordinate mapping (hornet ±0.5m → 10m SLAM space), `compute_slam_sensors()` producing real event-camera + ToF + kinematic odometry for `SNNSLAMSystem`; `ingest_perceptual_streams()` Asymmetric Instar rule routing visual belief → 4-dim CPG input |
+| `env.py` | [embodied_hornet/env.py](embodied_hornet/env.py) | `FlyEnv`: 1m×1m arena geometry generation (`regenerate_arena()`), SLAM coordinate mapping (hornet ±0.5m → 10m SLAM space), `compute_slam_sensors()` producing real event-camera + ToF + kinematic + MEMS accelerometer odometry (with physical flapping vibrations) for `SNNSLAMSystem`; `ingest_perceptual_streams()` Asymmetric Instar rule routing visual belief → 4-dim CPG input |
 | `neural_idapbc.py` | [embodied_hornet/neural_idapbc.py](embodied_hornet/neural_idapbc.py) | `IDA_PBC_Hover`, `hover_stable()`, `differentiable_attention_gate()` (DNAG) — blends policy with passivity-preserving hover modulations gated by real SLAM surprise |
-| `train.py` | [embodied_hornet/train.py](embodied_hornet/train.py) | Unified 12-dim observation, real `SNNSLAMSystem` integration (outside-JIT async loop), per-episode arena + SLAM reset, SHAC+PBT training loop |
+| `train.py` | [embodied_hornet/train.py](embodied_hornet/train.py) | Unified 12-dim observation, real `SNNSLAMSystem` integration (outside-JIT async loop), high-frequency decimation/accumulation of accelerometer signals, per-episode arena + SLAM reset, SHAC+PBT training loop |
 | `snn_live_slam.py` | [embodied_hornet/snn_live_slam.py](embodied_hornet/snn_live_slam.py) | Thin re-export wrapper over `neuro-symbolic-slam`'s module; adds surprise telemetry logging (threshold crossings for DNAG diagnostics) |
+| `snn_pose_cann.py` | [neuro-symbolic-slam/src/snn_pose_cann.py](neuro-symbolic-slam/src/snn_pose_cann.py) | `PoseCANN` heading ring attractor accepting estimated `theta_gravity` to inject corrective Gaussian currents, pulling the belief bump into alignment to arrest yaw drift. |
+| `snn_slam_system.py` | [neuro-symbolic-slam/src/snn_slam_system.py](neuro-symbolic-slam/src/snn_slam_system.py) | `SNNSLAMSystem.forward_step` complementary filter fusing proper acceleration and gyroscope rates to estimate absolute gravity pitch. |
 
 ---
 
