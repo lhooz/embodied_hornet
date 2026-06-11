@@ -32,16 +32,22 @@ def compute_sog_repulsive_force(robot_pos_slam, SOG_v_mem, map_size=2.0):
     
     # Compute displacements from robot pos (..., N, N, 2)
     disp = robot_pos_slam[..., None, None, :] - cell_positions
-    dist_sq = jnp.sum(disp**2, axis=-1) + 1e-5
+    dist_sq = jnp.sum(disp**2, axis=-1) + 1e-2  # Stabilize: floor at 1e-2 (10cm physical)
     
     # Only consider obstacles/walls (membrane potential > 0)
     active_mask = jnp.maximum(SOG_v_mem, 0.0)  # (..., N, N) or (N, N)
     
-    # Repulsion is proportional to SOG activity and inversely proportional to square of distance
-    repulsion = active_mask / (dist_sq ** 2)
+    # Stabilize: Repulsion proportional to 1/d^2 instead of 1/d^4 to prevent gradient explosion
+    repulsion = active_mask / dist_sq
     
     # Sum up all repulsive force contributions
     force = jnp.sum(disp * repulsion[..., None], axis=(-3, -2))  # (..., 2)
+    
+    # Safety Valve: Clip repulsive force magnitude to 10.0 to bound forces and gradients
+    force_magnitude = jnp.sqrt(jnp.sum(force**2, axis=-1) + 1e-8)
+    scale = jnp.where(force_magnitude > 10.0, 10.0 / force_magnitude, 1.0)
+    force = force * scale[..., None]
+    
     return force
 
 def policy_network_icnn(x, target_state=None, action_noise=None, SOG_v_mem=None, K_repel=0.0, tof_dists=None, K_flow=0.0):
@@ -64,7 +70,7 @@ def policy_network_icnn(x, target_state=None, action_noise=None, SOG_v_mem=None,
     if tof_dists is not None:
         # Left beam is index 0, Right beam is index 2
         # Looming differential: 1/ToF_left - 1/ToF_right
-        delta_proximity = 1.0 / (tof_dists[..., 0] + 1e-3) - 1.0 / (tof_dists[..., 2] + 1e-3)
+        delta_proximity = 1.0 / (tof_dists[..., 0] + 1e-2) - 1.0 / (tof_dists[..., 2] + 1e-2)
         pitch_torque_correction = K_flow * delta_proximity
         # Add pitch torque correction to Tau_theta (index 2)
         u_forces_newtons = u_forces_newtons.at[..., 2].add(pitch_torque_correction)

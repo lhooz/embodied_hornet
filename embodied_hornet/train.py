@@ -445,7 +445,7 @@ def run_visualization(env, params, update_idx, vis_step_fn):
                 est_pitch = float(pose_est[0, 2])
                 est_grav = float(vis_slam._theta_gravity[0])
                 print(f"  📊 [SLAM TELEMETRY] Step {i:03d} | Pos GT: ({slam_u:.2f}, {slam_v:.2f}) SLAM: ({last_slam_est_u:.2f}, {last_slam_est_v:.2f}) "
-                      f"| Pitch GT: {r_state_np[2]:.3f} rad, CF Grav: {est_grav:.3f} rad, CANN Head: {est_pitch:.3f} rad | Surprise: {last_slam_surprise:.3f}")
+                      f"| Pitch GT: {r_state_np[2] - 1.0:.3f} rad, CF Grav: {est_grav:.3f} rad, CANN Head: {est_pitch:.3f} rad | Surprise: {last_slam_surprise:.3f}")
                 
                 slam_vis_csnn_jax = jnp.array(debug_gates['Debug_Input_CSNN'])
                 slam_vis_stdp_jax = jnp.array(debug_gates['Debug_Input_STDP'])
@@ -1427,6 +1427,7 @@ def train():
         # 1. Update Step — keep a snapshot so we can roll back on NaN
         _prev_params   = params
         _prev_opt_state = opt_state
+
         params, opt_state, loss, logs, next_state, pbt_state, key_explore = update(
             params, opt_state, curr_state, pbt_state, key_explore,
             slam_pose, jnp.array(slam_surprise), env._obstacles, slam_vis_csnn, slam_vis_stdp, jnp.array(sog_state.v_mem),
