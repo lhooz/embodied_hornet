@@ -159,7 +159,7 @@ def symlog(x):
 # ==============================================================================
 # 2. MODEL DEFINITION
 # ==============================================================================
-def actor_critic_fn(combined_state, action_noise=None, SOG_v_mem=None, K_repel=0.0, tof_dists=None, K_flow=0.0):
+def actor_critic_fn(combined_state, action_noise=None, SOG_v_mem=None, K_repel=0.0, tof_dists=None, K_flow=0.0, robot_pos_slam=None):
     """
     Defines the Actor-Critic architecture over the unified state space.
     
@@ -180,7 +180,8 @@ def actor_critic_fn(combined_state, action_noise=None, SOG_v_mem=None, K_repel=0
         SOG_v_mem=SOG_v_mem,
         K_repel=K_repel,
         tof_dists=tof_dists,
-        K_flow=K_flow
+        K_flow=K_flow,
+        robot_pos_slam=robot_pos_slam
     )
     
     # 4. Critic evaluates the unified 12-dimensional observation
@@ -197,7 +198,7 @@ ac_model = hk.without_apply_rng(hk.transform(actor_critic_fn))
 # ==============================================================================
 # 2b. HOVER SPECIALIST MODEL (8D — matches hover_params.pkl from hornetRL)
 # ==============================================================================
-def hover_actor_fn(physical_state, action_noise=None, SOG_v_mem=None, K_repel=0.0, tof_dists=None, K_flow=0.0):
+def hover_actor_fn(physical_state, action_noise=None, SOG_v_mem=None, K_repel=0.0, tof_dists=None, K_flow=0.0, robot_pos_slam=None):
     """
     Original hornetRL actor architecture (8D physical state only).
     Matches the parameter structure of hover_params.pkl — trained by hornetRL
@@ -212,7 +213,8 @@ def hover_actor_fn(physical_state, action_noise=None, SOG_v_mem=None, K_repel=0.
         SOG_v_mem=SOG_v_mem,
         K_repel=K_repel,
         tof_dists=tof_dists,
-        K_flow=K_flow
+        K_flow=K_flow,
+        robot_pos_slam=robot_pos_slam
     )
     # Critic on 8D state (matching hover_params.pkl structure)
     value = hk.Sequential([
@@ -1022,7 +1024,7 @@ def train():
     # Batched hover network (vmapped over 32-agent PBT population)
     batched_hover_network = jax.vmap(
         hover_ac_model.apply,
-        in_axes=(0, 0, 0, None, None, 0, None)
+        in_axes=(0, 0, 0, None, None, 0, None, 0)
     )
 
     # Validate hover specialist with a dry-run forward pass before JIT
@@ -1032,8 +1034,9 @@ def train():
             _dummy_act  = jnp.zeros((_hover_batch, 4))
             _dummy_sog  = jnp.zeros((50, 50))
             _dummy_tof  = jnp.zeros((_hover_batch, 3))
+            _dummy_pos  = jnp.zeros((_hover_batch, 2))
             _test_mods, _, _ = batched_hover_network(
-                hover_fixed_params, _dummy_8d, _dummy_act, _dummy_sog, 0.0, _dummy_tof, 0.0
+                hover_fixed_params, _dummy_8d, _dummy_act, _dummy_sog, 0.0, _dummy_tof, 0.0, _dummy_pos
             )
             print(f"    -> Hover specialist validated: mods shape {_test_mods.shape}")
         except Exception as _e:
@@ -1121,9 +1124,9 @@ def train():
             )
 
             # 3. Policy Inference
-            batched_network = jax.vmap(ac_model.apply, in_axes=(0, 0, 0, None, None, 0, None))
+            batched_network = jax.vmap(ac_model.apply, in_axes=(0, 0, 0, None, None, 0, None, 0))
             mods, u_brain, _ = batched_network(
-                params, combined_obs, action_noise, SOG_v_mem, Config.K_REPEL, tof_dists, Config.K_FLOW
+                params, combined_obs, action_noise, SOG_v_mem, Config.K_REPEL, tof_dists, Config.K_FLOW, slam_pos_batch
             )
             
             # --- LYAPUNOV HOVER & ATTENTION GATING (DNAG) ---
@@ -1142,16 +1145,18 @@ def train():
             # noisy_obs is 8D (physical state only), matching the hover specialist's obs space.
             if _use_hover_specialist:
                 hover_mods, _, _ = batched_hover_network(
-                    hover_fixed_params, noisy_obs, jnp.zeros((B, 4)), SOG_v_mem, Config.K_REPEL, tof_dists, Config.K_FLOW
+                    hover_fixed_params, noisy_obs, jnp.zeros((B, 4)), SOG_v_mem, Config.K_REPEL, tof_dists, Config.K_FLOW, slam_pos_batch
                 )
             else:
                 # Fallback: velocity-zeroed policy (if hover_params.pkl was not found)
                 hover_robot   = curr_robot.at[:, 4:8].set(0.0)
+                hover_robot   = hover_robot.at[:, 0].set(slam_x_t - target_xy[:, 0])
+                hover_robot   = hover_robot.at[:, 1].set(slam_z_t - target_xy[:, 1])
                 hover_wrapped = jnp.mod(hover_robot[:, 2] + jnp.pi, 2 * jnp.pi) - jnp.pi
                 hover_obs_raw = hover_robot.at[:, 2].set(hover_wrapped)
                 hover_obs = jnp.concatenate([symlog(hover_obs_raw), curr_weighted_belief], axis=-1)
                 hover_mods, _, _ = batched_network(
-                    params, hover_obs, jnp.zeros((B, 4)), SOG_v_mem, Config.K_REPEL, tof_dists, Config.K_FLOW
+                    params, hover_obs, jnp.zeros((B, 4)), SOG_v_mem, Config.K_REPEL, tof_dists, Config.K_FLOW, slam_pos_batch
                 )
 
             # Fully differentiable attention gate blending.
@@ -1661,7 +1666,7 @@ def vis_step_fn(env, curr_state, curr_params, step_idx, slam_surprise, hover_par
 
     # 3. Policy Inference
     mods, _, _ = ac_model.apply(
-        curr_params, combined_obs, None, SOG_v_mem, K_repel, tof_dists, K_flow
+        curr_params, combined_obs, None, SOG_v_mem, K_repel, tof_dists, K_flow, slam_pos_batch
     )
     
     # --- LYAPUNOV HOVER & ATTENTION GATING (DNAG) ---
@@ -1673,7 +1678,7 @@ def vis_step_fn(env, curr_state, curr_params, step_idx, slam_surprise, hover_par
     
     if hover_params_single is not None:
         hover_mods, _, _ = hover_ac_model.apply(
-            hover_params_single, scaled_obs, None, SOG_v_mem, K_repel, tof_dists, K_flow
+            hover_params_single, scaled_obs, None, SOG_v_mem, K_repel, tof_dists, K_flow, slam_pos_batch
         )
     else:
         # Fallback: velocity-zeroed policy
@@ -1682,7 +1687,7 @@ def vis_step_fn(env, curr_state, curr_params, step_idx, slam_surprise, hover_par
         hover_obs_raw = hover_robot.at[:, 2].set(hover_wrapped)
         hover_obs = jnp.concatenate([symlog(hover_obs_raw), weighted_belief], axis=-1)
         hover_mods, _, _ = ac_model.apply(
-            curr_params, hover_obs, None, SOG_v_mem, K_repel, tof_dists, K_flow
+            curr_params, hover_obs, None, SOG_v_mem, K_repel, tof_dists, K_flow, slam_pos_batch
         )
         
     blended_mods, alpha = jax.vmap(differentiable_attention_gate)(sim_surprise, mods, hover_mods)
@@ -1693,8 +1698,7 @@ def vis_step_fn(env, curr_state, curr_params, step_idx, slam_surprise, hover_par
     next_state, _, f_nodal, w_pose, h_marker = env.step_batch(next_state, blended_mods, step_idx=step_idx)
     
     # Compute SOG repulsive force
-    robot_pos_slam = scaled_obs[:, :2] + 1.0
-    f_repel = compute_sog_repulsive_force(robot_pos_slam, SOG_v_mem)
+    f_repel = compute_sog_repulsive_force(slam_pos_batch, SOG_v_mem)
     f_repel_scaled = K_repel * f_repel
     
     # Compute EMD optic flow bias

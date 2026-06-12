@@ -50,7 +50,7 @@ def compute_sog_repulsive_force(robot_pos_slam, SOG_v_mem, map_size=2.0):
     
     return force
 
-def policy_network_icnn(x, target_state=None, action_noise=None, SOG_v_mem=None, K_repel=0.0, tof_dists=None, K_flow=0.0):
+def policy_network_icnn(x, target_state=None, action_noise=None, SOG_v_mem=None, K_repel=0.0, tof_dists=None, K_flow=0.0, robot_pos_slam=None):
     """
     Full Policy Pipeline: Brain -> Muscles (Enhanced with SOG & Optic Flow avoidance).
     
@@ -77,8 +77,18 @@ def policy_network_icnn(x, target_state=None, action_noise=None, SOG_v_mem=None,
 
     # 3. Inject SOG repulsive forces (Ventral pathway)
     if SOG_v_mem is not None:
-        # robot_pos in SLAM space is x_in[..., :2] + 1.0 (since offset is 1.0m)
-        robot_pos_slam = x_in[..., :2] + 1.0
+        if robot_pos_slam is None:
+            # Fallback: Reconstruct relative position from symlog observation
+            # x is symlog(obs_robot) where obs_robot[..., :2] = slam_pos_t - target_xy
+            # Since target_xy is at the origin of the relative observation space,
+            # we invert the symlog to retrieve target-relative position.
+            sign_x = jnp.sign(x[..., :2])
+            abs_x = jnp.abs(x[..., :2])
+            rel_pos = sign_x * jnp.expm1(abs_x)
+            # Assume target is at origin (0, 0), so slam_pos_t = rel_pos
+            # robot_pos_slam = slam_pos_t + 1.0 offset
+            robot_pos_slam = rel_pos + 1.0
+            
         f_repel = compute_sog_repulsive_force(robot_pos_slam, SOG_v_mem)
         # Add repulsive forces to Fx (index 0) and Fz (index 1)
         u_forces_newtons = u_forces_newtons.at[..., 0].add(K_repel * f_repel[..., 0])
