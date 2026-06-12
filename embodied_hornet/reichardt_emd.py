@@ -169,13 +169,20 @@ def pool_lptc(local_flow):
     n = local_flow.shape[0]
     mid = n // 2
     
-    # HS-cell centering reflex: left-side mean flow vs right-side mean flow
-    # Convention: positive flow = rightward motion (object approaching from right)
-    # Centering = right_flow - left_flow:
-    #   positive → more approach on the right → steer left (negative pitch torque)
-    flow_left = jnp.mean(local_flow[:mid])
-    flow_right = jnp.mean(local_flow[mid:])
-    centering = flow_right - flow_left
+    # HS-cell centering reflex: left-side mean flow vs right-side mean flow.
+    # To make the visual fields perfectly symmetric, we ignore the middle pair (index 15)
+    # so that both sides have exactly 15 elements.
+    #
+    # Flow direction convention: positive = rightward, negative = leftward.
+    # Under forward motion (expansion):
+    #   - Right side (flow_left) sees leftward motion (negative flow)
+    #   - Left side (flow_right) sees rightward motion (positive flow)
+    # Therefore, right-side approach gives flow_left < 0, left-side approach gives flow_right > 0.
+    # To get a signed steering signal (positive = steer left, negative = steer right):
+    #   centering = -flow_left - flow_right
+    flow_left = jnp.mean(local_flow[:mid])     # indices 0..14 (right visual field)
+    flow_right = jnp.mean(local_flow[mid+1:])  # indices 16..30 (left visual field)
+    centering = -flow_left - flow_right
     
     # LGMD looming escape: total unsigned flow energy
     # High values indicate rapid visual expansion from any direction
