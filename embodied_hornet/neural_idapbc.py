@@ -37,8 +37,9 @@ def compute_sog_repulsive_force(robot_pos_slam, SOG_v_mem, map_size=2.0):
     # Only consider obstacles/walls (membrane potential > 0)
     active_mask = jnp.maximum(SOG_v_mem, 0.0)  # (..., N, N) or (N, N)
     
-    # Stabilize: Repulsion proportional to 1/d^2 instead of 1/d^4 to prevent gradient explosion
-    repulsion = active_mask / dist_sq
+    # Local influence cutoff (e.g. 0.4 meters) to prevent long-range gravitation-like pulling
+    d_max = 0.4
+    repulsion = active_mask * jnp.maximum(1.0 / dist_sq - 1.0 / (d_max**2), 0.0)
     
     # Sum up all repulsive force contributions
     force = jnp.sum(disp * repulsion[..., None], axis=(-3, -2))  # (..., 2)
