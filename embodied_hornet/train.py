@@ -104,7 +104,7 @@ class Config:
     SIM_SUBSTEPS = 72       # Physics steps per Control Step
                             
     HORIZON = 32            # Trajectory horizon for Backpropagation (= 8 wingbeats @ 4 steps/beat)
-    RESET_INTERVAL = 50     
+    RESET_INTERVAL = 300     
     PBT_INTERVAL = 500      
 
     BATCH_SIZE = 32          
@@ -1410,7 +1410,7 @@ def train():
         new_slam_z  = float(r0[1]) * env._slam_scale + 1.0
         new_slam_th = float(r0[2]) - 1.0
 
-        slam_system.reset(1)
+        slam_system.reset_pose_only(1)
         slam_system.initialize_pose(
             jnp.array([[new_slam_x, new_slam_z]]),
             jnp.array([new_slam_th]),
