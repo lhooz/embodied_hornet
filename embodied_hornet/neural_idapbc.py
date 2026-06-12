@@ -3,7 +3,7 @@ embodied_hornet/neural_idapbc.py
 
 Integration extensions to hornetRL's IDA-PBC controller.
 Imports all base classes from the hornetRL submodule and adds:
-  - Spiking Optic Flow centering reflex (Dorsal pathway)
+  - Hassenstein-Reichardt EMD reflexes (Dorsal pathway — LPTC)
   - Spiking Occupancy Grid (SOG) Artificial Potential Field (Ventral pathway)
   - differentiable_attention_gate(): DNAG smooth blending based on SLAM surprise
 """
@@ -54,11 +54,18 @@ def compute_sog_repulsive_force(robot_pos_slam, SOG_v_mem, map_size=2.0):
     
     return force
 
-def policy_network_icnn(x, target_state=None, action_noise=None, SOG_v_mem=None, K_repel=0.0, tof_dists=None, K_flow=0.0, robot_pos_slam=None):
+def policy_network_icnn(x, target_state=None, action_noise=None, SOG_v_mem=None, K_repel=0.0,
+                        emd_signals=None, K_flow=0.0, K_loom=0.0, robot_pos_slam=None):
     """
-    Full Policy Pipeline: Brain -> Muscles (Enhanced with SOG & Optic Flow avoidance).
+    Full Policy Pipeline: Brain -> Muscles (Enhanced with SOG & EMD avoidance).
     
     Maps normalized observations to biological CPG modulation parameters.
+    
+    The Dorsal pathway now uses Hassenstein-Reichardt EMD signals from the
+    1D ommatidial array (event camera), replacing the previous static ToF
+    proximity differential.  Two LPTC reflexes are injected:
+      - HS centering:  pitch torque to steer away from approaching side
+      - LGMD looming:  forward deceleration when total expansion is high
     """
     if target_state is None:
         target_state = jnp.array([0.0, 0.0, 1.0, 0.2, 0.0, 0.0, 0.0, 0.0])
@@ -70,14 +77,16 @@ def policy_network_icnn(x, target_state=None, action_noise=None, SOG_v_mem=None,
     brain = NeuralIDAPBC_ICNN(target_state)
     u_forces_newtons = brain(x_in)
 
-    # 2. Inject Spiking Optic Flow centering reflex (Dorsal pathway)
-    if tof_dists is not None:
-        # Left beam is index 0, Right beam is index 2
-        # Looming differential: 1/ToF_left - 1/ToF_right
-        delta_proximity = 1.0 / (tof_dists[..., 0] + 1e-2) - 1.0 / (tof_dists[..., 2] + 1e-2)
-        pitch_torque_correction = K_flow * delta_proximity
-        # Add pitch torque correction to Tau_theta (index 2)
-        u_forces_newtons = u_forces_newtons.at[..., 2].add(pitch_torque_correction)
+    # 2. Inject Hassenstein-Reichardt EMD reflexes (Dorsal pathway — LPTC)
+    #    emd_signals[..., 0] = HS centering: left-vs-right flow differential
+    #    emd_signals[..., 1] = LGMD looming: total unsigned flow energy
+    if emd_signals is not None:
+        centering = emd_signals[..., 0]
+        looming   = emd_signals[..., 1]
+        # HS-cell centering: pitch torque correction (steer away from approaching side)
+        u_forces_newtons = u_forces_newtons.at[..., 2].add(K_flow * centering)
+        # LGMD looming escape: forward deceleration (brake when total expansion is high)
+        u_forces_newtons = u_forces_newtons.at[..., 0].add(-K_loom * looming)
 
     # 3. Inject SOG repulsive forces (Ventral pathway)
     if SOG_v_mem is not None:

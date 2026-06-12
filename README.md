@@ -139,20 +139,25 @@ All integration code lives in `embodied_hornet/` (this package). The dependency 
 This project incorporates a dual-pathway, neuromorphic obstacle avoidance system inspired by biological flying insects. It combines low-latency reflexive steering with topological spatial maps to safely navigate complex environments:
 
 ### Hybrid Biological Stream Architecture
-1. **The Dorsal Stream (LPTC Optic Flow Reflex):** Processes event streams from the 1D Event Camera using Elementary Motion Detectors (EMDs) to compute differential flow. Looming or visual expansion on one side triggers a direct optomotor centering response.
+1. **The Dorsal Stream (LPTC Optic Flow Reflex):** A 32-pixel ommatidial array (downsampled from the 256-pixel event camera) feeds into a **Hassenstein-Reichardt cross-correlator** — the canonical insect Elementary Motion Detector (EMD). Adjacent pixel pairs are temporally delayed and multiplied to extract signed local motion, then pooled into two wide-field **Lobula Plate Tangential Cell (LPTC)** reflexes:
+   - **HS-cell centering:** Left-vs-right flow differential drives a pitch torque correction (optomotor centering response).
+   - **LGMD looming escape:** Total unsigned flow energy triggers forward deceleration when rapid visual expansion is detected.
 2. **The Ventral Stream (Central Complex Map Navigation):** Uses the Spiking Occupancy Grid (SOG) representing local memory to construct a fully differentiable **Artificial Potential Field (APF)**. The gradient of this field is added directly to the port-Hamiltonian energy function, generating Lyapunov-stable steering forces away from obstacles.
 
 ```mermaid
 graph TD
-    EventCam["1D Event Camera (256 pix)"] --> EMD["Elementary Motion Detector (Lobula Plate)"]
+    EventCam["1D Ommatidial Array (32 pix)"] --> Reichardt["Hassenstein-Reichardt EMD<br/>(Delay-and-Correlate)"]
     ToF["3-Beam ToF Sonar"] --> SOG["Spiking Occupancy Grid Map (LIF Sheet)"]
     
-    EMD -->|Differential Flow| CPGSteer["CPG Steering Bias (Dorsal)"]
-    SOG -->|Repulsive potential| APF["Artificial Potential Field (Ventral)"]
+    Reichardt --> HS["HS-Cell Pool<br/>(L-R Flow Differential)"]
+    Reichardt --> LGMD["LGMD Pool<br/>(Total Expansion Energy)"]
     
-    APF -->|Energy gradient| IDAPBC["Neural IDA-PBC Actor"]
+    HS -->|Centering torque| IDAPBC["Neural IDA-PBC Actor"]
+    LGMD -->|Braking force| IDAPBC
+    SOG -->|Repulsive potential| APF["Artificial Potential Field (Ventral)"]
+    APF -->|Energy gradient| IDAPBC
+    
     IDAPBC --> CPG["CPG Modulator"]
-    CPGSteer --> CPG
     CPG --> Kinematics["Wing Kinematics"]
 ```
 

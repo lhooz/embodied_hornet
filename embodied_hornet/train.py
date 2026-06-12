@@ -26,6 +26,7 @@ from functools import partial
 
 # --- INTEGRATION MODULES (modified for embodied_hornet) ---
 from .neural_idapbc import policy_network_icnn, differentiable_attention_gate, unpack_action, ScaleConfig, compute_sog_repulsive_force
+from .reichardt_emd import compute_emd_intensities, compute_emd_signals, N_EMD_PIX
 from .env import FlyEnv
 
 # --- BASE MODULES FROM hornetRL SIBLING REPO ---
@@ -124,7 +125,9 @@ class Config:
     
     # --- Obstacle Avoidance Gains ---
     K_REPEL = 0.005
-    K_FLOW = 0.005
+    K_FLOW = 0.3         # HS centering reflex gain (Dorsal stream — pitch torque)
+    K_LOOM = 0.1         # LGMD looming escape gain (Dorsal stream — forward deceleration)
+    N_EMD_PIX = 32       # Coarse ommatidial array resolution (Dorsal stream)
     
     # --- PBT Hyperparameters ---
     PBT_BASE_WEIGHTS = jnp.array([
@@ -159,7 +162,7 @@ def symlog(x):
 # ==============================================================================
 # 2. MODEL DEFINITION
 # ==============================================================================
-def actor_critic_fn(combined_state, action_noise=None, SOG_v_mem=None, K_repel=0.0, tof_dists=None, K_flow=0.0, robot_pos_slam=None):
+def actor_critic_fn(combined_state, action_noise=None, SOG_v_mem=None, K_repel=0.0, emd_signals=None, K_flow=0.0, K_loom=0.0, robot_pos_slam=None):
     """
     Defines the Actor-Critic architecture over the unified state space.
     
@@ -179,8 +182,9 @@ def actor_critic_fn(combined_state, action_noise=None, SOG_v_mem=None, K_repel=0
         action_noise=action_noise,
         SOG_v_mem=SOG_v_mem,
         K_repel=K_repel,
-        tof_dists=tof_dists,
+        emd_signals=emd_signals,
         K_flow=K_flow,
+        K_loom=K_loom,
         robot_pos_slam=robot_pos_slam
     )
     
@@ -198,7 +202,7 @@ ac_model = hk.without_apply_rng(hk.transform(actor_critic_fn))
 # ==============================================================================
 # 2b. HOVER SPECIALIST MODEL (8D — matches hover_params.pkl from hornetRL)
 # ==============================================================================
-def hover_actor_fn(physical_state, action_noise=None, SOG_v_mem=None, K_repel=0.0, tof_dists=None, K_flow=0.0, robot_pos_slam=None):
+def hover_actor_fn(physical_state, action_noise=None, SOG_v_mem=None, K_repel=0.0, emd_signals=None, K_flow=0.0, K_loom=0.0, robot_pos_slam=None):
     """
     Original hornetRL actor architecture (8D physical state only).
     Matches the parameter structure of hover_params.pkl — trained by hornetRL
@@ -212,8 +216,9 @@ def hover_actor_fn(physical_state, action_noise=None, SOG_v_mem=None, K_repel=0.
         action_noise=action_noise,
         SOG_v_mem=SOG_v_mem,
         K_repel=K_repel,
-        tof_dists=tof_dists,
+        emd_signals=emd_signals,
         K_flow=K_flow,
+        K_loom=K_loom,
         robot_pos_slam=robot_pos_slam
     )
     # Critic on 8D state (matching hover_params.pkl structure)
@@ -329,6 +334,7 @@ def run_visualization(env, params, update_idx, vis_step_fn):
     sim_data['sog_states'] = []  # per-frame v_mem snapshots for animation replay
 
     current_step_counter = 0
+    vis_emd_intensities = jnp.zeros((1, Config.N_EMD_PIX))
 
     for i in range(total_visual_frames):
         for _ in range(steps_per_frame):
@@ -341,8 +347,8 @@ def run_visualization(env, params, update_idx, vis_step_fn):
             slam_pose_jax = jnp.array([[slam_est_u, slam_est_v, slam_est_th]])
             vis_step_idx = current_step_counter + Config.WARMUP_STEPS + 5
             vis_target_xy = jnp.array([[0.5, -0.5]])  # target waypoint for visualization
-            state, f_nodal, w_pose, h_marker, alpha_floored_jax, f_repel_scaled_jax, flow_corr_jax = vis_step_fn(
-                env, state, params_single, vis_step_idx, jnp.array([last_slam_surprise]), hover_params_single, slam_pose_jax, slam_vis_csnn_jax, slam_vis_stdp_jax, _sog_state.v_mem, Config.K_REPEL, Config.K_FLOW, vis_target_xy
+            state, f_nodal, w_pose, h_marker, alpha_floored_jax, f_repel_scaled_jax, flow_corr_jax, vis_emd_intensities = vis_step_fn(
+                env, state, params_single, vis_step_idx, jnp.array([last_slam_surprise]), hover_params_single, slam_pose_jax, slam_vis_csnn_jax, slam_vis_stdp_jax, _sog_state.v_mem, Config.K_REPEL, Config.K_FLOW, vis_target_xy, vis_emd_intensities
             )
             current_step_counter += 1
 
@@ -1024,7 +1030,7 @@ def train():
     # Batched hover network (vmapped over 32-agent PBT population)
     batched_hover_network = jax.vmap(
         hover_ac_model.apply,
-        in_axes=(0, 0, 0, None, None, 0, None, 0)
+        in_axes=(0, 0, 0, None, None, 0, None, None, 0)
     )
 
     # Validate hover specialist with a dry-run forward pass before JIT
@@ -1033,10 +1039,10 @@ def train():
             _dummy_8d   = jnp.zeros((_hover_batch, 8))
             _dummy_act  = jnp.zeros((_hover_batch, 4))
             _dummy_sog  = jnp.zeros((50, 50))
-            _dummy_tof  = jnp.zeros((_hover_batch, 3))
+            _dummy_emd  = jnp.zeros((_hover_batch, 2))
             _dummy_pos  = jnp.zeros((_hover_batch, 2))
             _test_mods, _, _ = batched_hover_network(
-                hover_fixed_params, _dummy_8d, _dummy_act, _dummy_sog, 0.0, _dummy_tof, 0.0, _dummy_pos
+                hover_fixed_params, _dummy_8d, _dummy_act, _dummy_sog, 0.0, _dummy_emd, 0.0, 0.0, _dummy_pos
             )
             print(f"    -> Hover specialist validated: mods shape {_test_mods.shape}")
         except Exception as _e:
@@ -1063,6 +1069,7 @@ def train():
         # We also pass a running observation state as a carry: start with zeros for the perceptual feedback
         B = Config.BATCH_SIZE
         initial_weighted_belief = jnp.zeros((B, 4))
+        initial_emd_intensities = jnp.zeros((B, Config.N_EMD_PIX))
         
         # Convert SLAM pose from physical 2m space → hornet physical metres for Instar routing
         # slam_pose[:2] = (x, y) in physical SLAM (= hornet + 1.0); slam_pose[2] = heading
@@ -1072,10 +1079,10 @@ def train():
         frozen_surp  = jnp.full((B,), slam_surprise)                  # same surprise for all agents
         
         scan_inputs = (rollout_indices, phys_indices, scan_keys)
-        init_carry = (start_state, initial_weighted_belief)
+        init_carry = (start_state, initial_weighted_belief, initial_emd_intensities)
 
         def scan_fn(carry, xs): 
-            curr_full, curr_weighted_belief = carry
+            curr_full, curr_weighted_belief, prev_emd_intensities = carry
             r_idx, p_idx, step_key = xs
             
             curr_robot = curr_full[0]
@@ -1113,20 +1120,24 @@ def train():
             key_noise, key_step = jax.random.split(step_key)
             action_noise = jax.random.normal(key_noise, shape=(B, 4)) * Config.ACTION_NOISE_SIGMA
 
-            # Compute ToF distances for EMD optic flow
+            # Compute SLAM position and sensor heading for dorsal/ventral pathways
             slam_u_batch = curr_robot[:, 0] * env._slam_scale + 1.0
             slam_v_batch = curr_robot[:, 1] * env._slam_scale + 1.0
             slam_pos_batch = jnp.stack([slam_u_batch, slam_v_batch], axis=-1)
             sensor_heading_batch = curr_robot[:, 2] - 1.0
-            
-            tof_dists = jax.vmap(compute_tof_distance, in_axes=(0, 0, None))(
+
+            # --- DORSAL STREAM: Hassenstein-Reichardt EMD Pipeline ---
+            # 1. Render coarse ommatidial intensities (32 pixels, distance-based)
+            curr_emd_intensities, _ = jax.vmap(compute_emd_intensities, in_axes=(0, 0, None))(
                 slam_pos_batch, sensor_heading_batch, env._segments
             )
+            # 2. Reichardt correlate + LPTC pool: centering (HS) + looming (LGMD)
+            emd_signals = jax.vmap(compute_emd_signals)(prev_emd_intensities, curr_emd_intensities)
 
             # 3. Policy Inference
-            batched_network = jax.vmap(ac_model.apply, in_axes=(0, 0, 0, None, None, 0, None, 0))
+            batched_network = jax.vmap(ac_model.apply, in_axes=(0, 0, 0, None, None, 0, None, None, 0))
             mods, u_brain, _ = batched_network(
-                params, combined_obs, action_noise, SOG_v_mem, Config.K_REPEL, tof_dists, Config.K_FLOW, slam_pos_batch
+                params, combined_obs, action_noise, SOG_v_mem, Config.K_REPEL, emd_signals, Config.K_FLOW, Config.K_LOOM, slam_pos_batch
             )
             
             # --- LYAPUNOV HOVER & ATTENTION GATING (DNAG) ---
@@ -1145,7 +1156,7 @@ def train():
             # noisy_obs is 8D (physical state only), matching the hover specialist's obs space.
             if _use_hover_specialist:
                 hover_mods, _, _ = batched_hover_network(
-                    hover_fixed_params, noisy_obs, jnp.zeros((B, 4)), SOG_v_mem, Config.K_REPEL, tof_dists, Config.K_FLOW, slam_pos_batch
+                    hover_fixed_params, noisy_obs, jnp.zeros((B, 4)), SOG_v_mem, Config.K_REPEL, emd_signals, Config.K_FLOW, Config.K_LOOM, slam_pos_batch
                 )
             else:
                 # Fallback: velocity-zeroed policy (if hover_params.pkl was not found)
@@ -1156,7 +1167,7 @@ def train():
                 hover_obs_raw = hover_robot.at[:, 2].set(hover_wrapped)
                 hover_obs = jnp.concatenate([symlog(hover_obs_raw), curr_weighted_belief], axis=-1)
                 hover_mods, _, _ = batched_network(
-                    params, hover_obs, jnp.zeros((B, 4)), SOG_v_mem, Config.K_REPEL, tof_dists, Config.K_FLOW, slam_pos_batch
+                    params, hover_obs, jnp.zeros((B, 4)), SOG_v_mem, Config.K_REPEL, emd_signals, Config.K_FLOW, Config.K_LOOM, slam_pos_batch
                 )
 
             # Fully differentiable attention gate blending.
@@ -1245,9 +1256,9 @@ def train():
                 met['ang_th'], met['ang_ab'], 
                 met['vel_lin'], met['vel_ang']
             )
-            return (next_full, next_weighted_belief), step_metrics
+            return (next_full, next_weighted_belief, curr_emd_intensities), step_metrics
 
-        (final_full, final_weighted_belief), step_results = jax.lax.scan(
+        (final_full, final_weighted_belief, _), step_results = jax.lax.scan(
             scan_fn, init_carry, scan_inputs
         )
         
@@ -1625,7 +1636,7 @@ def train():
 
 # Global Visualization Step
 @partial(jax.jit, static_argnums=(0,))
-def vis_step_fn(env, curr_state, curr_params, step_idx, slam_surprise, hover_params_single, slam_pose, vis_csnn, vis_stdp, SOG_v_mem, K_repel, K_flow, target_xy):
+def vis_step_fn(env, curr_state, curr_params, step_idx, slam_surprise, hover_params_single, slam_pose, vis_csnn, vis_stdp, SOG_v_mem, K_repel, K_flow, target_xy, prev_emd_intensities):
     r_st = curr_state[0]
     B = r_st.shape[0]
     
@@ -1654,19 +1665,21 @@ def vis_step_fn(env, curr_state, curr_params, step_idx, slam_surprise, hover_par
     
     combined_obs = jnp.concatenate([scaled_obs, weighted_belief], axis=-1)
     
-    # Compute ToF distances for EMD optic flow
+    # Compute SLAM position and sensor heading for dorsal/ventral pathways
     slam_u_batch = r_st[:, 0] * env._slam_scale + 1.0
     slam_v_batch = r_st[:, 1] * env._slam_scale + 1.0
     slam_pos_batch = jnp.stack([slam_u_batch, slam_v_batch], axis=-1)
     sensor_heading_batch = r_st[:, 2] - 1.0
-    
-    tof_dists = jax.vmap(compute_tof_distance, in_axes=(0, 0, None))(
+
+    # --- DORSAL STREAM: Hassenstein-Reichardt EMD Pipeline ---
+    curr_emd_intensities, _ = jax.vmap(compute_emd_intensities, in_axes=(0, 0, None))(
         slam_pos_batch, sensor_heading_batch, env._segments
     )
+    emd_signals = jax.vmap(compute_emd_signals)(prev_emd_intensities, curr_emd_intensities)
 
     # 3. Policy Inference
     mods, _, _ = ac_model.apply(
-        curr_params, combined_obs, None, SOG_v_mem, K_repel, tof_dists, K_flow, slam_pos_batch
+        curr_params, combined_obs, None, SOG_v_mem, K_repel, emd_signals, K_flow, Config.K_LOOM, slam_pos_batch
     )
     
     # --- LYAPUNOV HOVER & ATTENTION GATING (DNAG) ---
@@ -1678,7 +1691,7 @@ def vis_step_fn(env, curr_state, curr_params, step_idx, slam_surprise, hover_par
     
     if hover_params_single is not None:
         hover_mods, _, _ = hover_ac_model.apply(
-            hover_params_single, scaled_obs, None, SOG_v_mem, K_repel, tof_dists, K_flow, slam_pos_batch
+            hover_params_single, scaled_obs, None, SOG_v_mem, K_repel, emd_signals, K_flow, Config.K_LOOM, slam_pos_batch
         )
     else:
         # Fallback: velocity-zeroed policy
@@ -1687,7 +1700,7 @@ def vis_step_fn(env, curr_state, curr_params, step_idx, slam_surprise, hover_par
         hover_obs_raw = hover_robot.at[:, 2].set(hover_wrapped)
         hover_obs = jnp.concatenate([symlog(hover_obs_raw), weighted_belief], axis=-1)
         hover_mods, _, _ = ac_model.apply(
-            curr_params, hover_obs, None, SOG_v_mem, K_repel, tof_dists, K_flow, slam_pos_batch
+            curr_params, hover_obs, None, SOG_v_mem, K_repel, emd_signals, K_flow, Config.K_LOOM, slam_pos_batch
         )
         
     blended_mods, alpha = jax.vmap(differentiable_attention_gate)(sim_surprise, mods, hover_mods)
@@ -1701,11 +1714,11 @@ def vis_step_fn(env, curr_state, curr_params, step_idx, slam_surprise, hover_par
     f_repel = compute_sog_repulsive_force(slam_pos_batch, SOG_v_mem)
     f_repel_scaled = K_repel * f_repel
     
-    # Compute EMD optic flow bias
-    delta_proximity = 1.0 / (tof_dists[..., 0] + 1e-3) - 1.0 / (tof_dists[..., 2] + 1e-3)
-    flow_corr = K_flow * delta_proximity
+    # Compute EMD-derived centering signal for telemetry
+    centering_signal = emd_signals[:, 0]
+    flow_corr = K_flow * centering_signal
     
-    return next_state, f_nodal, w_pose, h_marker, alpha_floored, f_repel_scaled, flow_corr
+    return next_state, f_nodal, w_pose, h_marker, alpha_floored, f_repel_scaled, flow_corr, curr_emd_intensities
 
 if __name__ == "__main__":
     import argparse
