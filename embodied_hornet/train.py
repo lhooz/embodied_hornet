@@ -1091,7 +1091,9 @@ def train():
             obs_robot = curr_robot
             obs_robot = obs_robot.at[:, 0].set(slam_x_t - target_xy[:, 0])
             obs_robot = obs_robot.at[:, 1].set(slam_z_t - target_xy[:, 1])
-            wrapped_theta = jnp.mod(slam_th_t + jnp.pi, 2 * jnp.pi) - jnp.pi
+            # Reconstruct absolute body pitch: SLAM heading + 1.0 rad
+            body_pitch_est = slam_th_t + 1.0
+            wrapped_theta = jnp.mod(body_pitch_est + jnp.pi, 2 * jnp.pi) - jnp.pi
             obs_robot = obs_robot.at[:, 2].set(wrapped_theta)
 
             scaled_obs = symlog(obs_robot)
@@ -1254,8 +1256,10 @@ def train():
         weighted_loss = jnp.dot(discounts, losses)
         
         final_robot = final_full[0]
-        f_wrapped_th = jnp.mod(final_robot[:, 2] + jnp.pi, 2 * jnp.pi) - jnp.pi
-        final_obs = symlog(final_robot.at[:, 2].set(f_wrapped_th))
+        final_rel = final_robot.at[:, 0].set(final_robot[:, 0] - target_xy[:, 0])
+        final_rel = final_rel.at[:, 1].set(final_robot[:, 1] - target_xy[:, 1])
+        f_wrapped_th = jnp.mod(final_rel[:, 2] + jnp.pi, 2 * jnp.pi) - jnp.pi
+        final_obs = symlog(final_rel.at[:, 2].set(f_wrapped_th))
         
         # Concat final observation for the critic bootstrap
         final_combined_obs = jnp.concatenate([final_obs, final_weighted_belief], axis=-1)
@@ -1269,8 +1273,10 @@ def train():
         discounted_return = jnp.dot(discounts, rewards_scaled) + (Config.GAMMA**Config.HORIZON * final_val_target)
         
         start_robot = start_state[0]
-        s_wrapped_th = jnp.mod(start_robot[:, 2] + jnp.pi, 2 * jnp.pi) - jnp.pi
-        start_obs = symlog(start_robot.at[:, 2].set(s_wrapped_th))
+        start_rel = start_robot.at[:, 0].set(start_robot[:, 0] - target_xy[:, 0])
+        start_rel = start_rel.at[:, 1].set(start_robot[:, 1] - target_xy[:, 1])
+        s_wrapped_th = jnp.mod(start_rel[:, 2] + jnp.pi, 2 * jnp.pi) - jnp.pi
+        start_obs = symlog(start_rel.at[:, 2].set(s_wrapped_th))
         start_combined_obs = jnp.concatenate([start_obs, initial_weighted_belief], axis=-1)
 
         _, _, start_val = jax.vmap(ac_model.apply)(params, start_combined_obs)
@@ -1626,8 +1632,9 @@ def vis_step_fn(env, curr_state, curr_params, step_idx, slam_surprise, hover_par
     obs_v = r_st
     obs_v = obs_v.at[:, 0].set(pose_belief[:, 0] - target_xy[:, 0])
     obs_v = obs_v.at[:, 1].set(pose_belief[:, 1] - target_xy[:, 1])
-    obs_v = obs_v.at[:, 2].set(pose_belief[:, 2])
-    wrapped_th = jnp.mod(obs_v[:, 2] + jnp.pi, 2 * jnp.pi) - jnp.pi
+    # Reconstruct absolute body pitch: SLAM heading + 1.0 rad
+    body_pitch_est = pose_belief[:, 2] + 1.0
+    wrapped_th = jnp.mod(body_pitch_est + jnp.pi, 2 * jnp.pi) - jnp.pi
     obs_v = obs_v.at[:, 2].set(wrapped_th)
     scaled_obs = symlog(obs_v)
     
