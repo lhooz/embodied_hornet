@@ -261,12 +261,8 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
         'flow_corr': [],
     }
     
-    CANN_DT = 0.02
     physics_dt = Config.DT * Config.SIM_SUBSTEPS * steps_per_frame
-    slam_time_acc = 0.0
-    ev_acc = np.zeros(256, dtype=np.float32)
     kin_acc = np.zeros(3, dtype=np.float32)
-    acc_acc = np.zeros(2, dtype=np.float32)
     kin_count = 0
     
     best_idx = 0
@@ -488,11 +484,11 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
             avg_kin = kin_acc / max(1, kin_count)
             
             try:
-                scale_factor = elapsed_time / CANN_DT
                 pose_est, _, _, _, _, debug_gates = vis_slam.forward_step(
-                    ev_jax, jnp.array([avg_kin * scale_factor]), tof_jax,
+                    ev_jax, jnp.array([avg_kin]), tof_jax,
                     acc_t=acc_jax,
-                    inject_drift=False, autopilot_on=(last_slam_surprise < 0.60)
+                    inject_drift=False, autopilot_on=(last_slam_surprise < 0.60),
+                    dt=elapsed_time
                 )
                 last_slam_surprise = float(1.0 - float(debug_gates['Raw_Match'][0]))
                 
@@ -1543,13 +1539,15 @@ def train():
             robot0_np, slam_prev_int, dt=Config.HORIZON * Config.SIM_SUBSTEPS * Config.DT
         )
         # Run SLAM steps (closed-loop with full memory + loop closure detection)
-        # 3 steps (3 x 0.02s = 0.06s) align the SLAM time-scale with the 32-step physical horizon (0.069s)
+        # 3 steps align the SLAM time-scale with the 32-step physical horizon (0.069s)
+        dt_horizon = Config.HORIZON * Config.SIM_SUBSTEPS * Config.DT
+        dt_per_cann_step = dt_horizon / 3.0  # ≈ 0.02304 s per CANN step
         try:
-            kin_jax_scaled = kin_jax * 1.152
             for _ in range(3):
                 pose_est, _, _, _, _, debug_gates = slam_system.forward_step(
-                    ev_jax, kin_jax_scaled, tof_jax, acc_t=acc_jax,
-                    inject_drift=False, autopilot_on=(slam_surprise < 0.60)
+                    ev_jax, kin_jax, tof_jax, acc_t=acc_jax,
+                    inject_drift=False, autopilot_on=(slam_surprise < 0.60),
+                    dt=dt_per_cann_step
                 )
             slam_pose     = jnp.array([
                 float(pose_est[0, 0]),   # x in 2m space
