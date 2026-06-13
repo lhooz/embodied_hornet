@@ -105,7 +105,7 @@ class Config:
     SIM_SUBSTEPS = 72       # Physics steps per Control Step
                             
     HORIZON = 32            # Trajectory horizon for Backpropagation (= 8 wingbeats @ 4 steps/beat)
-    RESET_INTERVAL = 300     
+    RESET_INTERVAL = 200     
     PBT_INTERVAL = 500      
 
     BATCH_SIZE = 32          
