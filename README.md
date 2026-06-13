@@ -139,9 +139,11 @@ All integration code lives in `embodied_hornet/` (this package). The dependency 
 This project incorporates a dual-pathway, neuromorphic obstacle avoidance system inspired by biological flying insects. It combines low-latency reflexive steering with topological spatial maps to safely navigate complex environments:
 
 ### Hybrid Biological Stream Architecture
-1. **The Dorsal Stream (LPTC Optic Flow Reflex):** A 32-pixel ommatidial array (downsampled from the 256-pixel event camera) feeds into a **Hassenstein-Reichardt cross-correlator** — the canonical insect Elementary Motion Detector (EMD). Adjacent pixel pairs are temporally delayed and multiplied to extract signed local motion, then pooled into two wide-field **Lobula Plate Tangential Cell (LPTC)** reflexes:
-   - **HS-cell centering:** Left-vs-right flow differential drives a pitch torque correction (optomotor centering response).
-   - **LGMD looming escape:** Total unsigned flow energy triggers forward deceleration when rapid visual expansion is detected.
+1. **The Dorsal Stream (LPTC Optic Flow Reflex with Adaptive Co-optimization):** A 32-pixel ommatidial array (downsampled from the 256-pixel event camera) feeds into a **Hassenstein-Reichardt cross-correlator** — the canonical insect Elementary Motion Detector (EMD). Adjacent pixel pairs are temporally delayed and multiplied to extract signed local motion, then pooled into two wide-field **Lobula Plate Tangential Cell (LPTC)** reflexes. Both the filters and coupling gains are co-optimized end-to-end:
+   - **Speed-Adaptive EMD Delay (Temporal Adaptation):** The EMD photoreceptor delay constant $\tau$ adapts dynamically to the hornet's speed ($\tau(v) = \tau_{base} / (1.0 + \gamma \cdot \|v\|)$). This speeds up EMD temporal response during rapid flight to capture fast-moving edges, while keeping it stable at low speeds.
+   - **State-Dependent Neuromodulation:** Instead of fixed coupling gains, a parallel neuromodulatory network dynamically outputs gains $K_{flow\_dyn}(x) \in [0.0, 1.0]$ and $K_{loom\_dyn}(x) \in [0.0, 0.5]$ based on the 8D physical state. The brain learns to dial up reflexes during high-speed obstacle avoidance and dial them down to zero during stable hovering at the target.
+   - **HS-cell centering:** Left-vs-right flow differential drives a pitch torque correction scaled by $K_{flow\_dyn}$ (optomotor centering response).
+   - **LGMD looming escape:** Total unsigned flow energy triggers forward deceleration scaled by $K_{loom\_dyn}$ when rapid visual expansion is detected.
 2. **The Ventral Stream (Central Complex Map Navigation):** Uses the Spiking Occupancy Grid (SOG) representing local memory to construct a fully differentiable **Artificial Potential Field (APF)**. The gradient of this field is added directly to the port-Hamiltonian energy function, generating Lyapunov-stable steering forces away from obstacles.
 
 ```mermaid
@@ -149,10 +151,17 @@ graph TD
     EventCam["1D Ommatidial Array (32 pix)"] --> Reichardt["Hassenstein-Reichardt EMD<br/>(Delay-and-Correlate)"]
     ToF["3-Beam ToF Sonar"] --> SOG["Spiking Occupancy Grid Map (LIF Sheet)"]
     
+    State["8D Physical State"] -->|Speed-adaptive tau| Reichardt
+    State --> Neuromod["Neuromodulator MLP"]
+    State --> IDAPBC["Neural IDA-PBC Actor"]
+    
     Reichardt --> HS["HS-Cell Pool<br/>(L-R Flow Differential)"]
     Reichardt --> LGMD["LGMD Pool<br/>(Total Expansion Energy)"]
     
-    HS -->|Centering torque| IDAPBC["Neural IDA-PBC Actor"]
+    Neuromod -->|K_flow_dyn| HS
+    Neuromod -->|K_loom_dyn| LGMD
+    
+    HS -->|Centering torque| IDAPBC
     LGMD -->|Braking force| IDAPBC
     SOG -->|Repulsive potential| APF["Artificial Potential Field (Ventral)"]
     APF -->|Energy gradient| IDAPBC
