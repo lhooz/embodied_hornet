@@ -38,7 +38,7 @@ from hornetRL.pbt_manager import init_pbt_state, pbt_evolve
 # --- SLAM SYSTEM FROM neuro-symbolic-slam SUBMODULE ---
 # (sys.path for src/ is configured in embodied_hornet/__init__.py)
 from snn_slam_system import SNNSLAMSystem, N_DEPTH, SpikingOccupancyGrid
-from sparse_forest import N_PIXELS, compute_tof_distance
+from sparse_forest import N_PIXELS, compute_tof_distance, compute_pixel_readings, THRESHOLD
 
 # ---------------------------------------------------------------------------
 # SOG Ray-Casting Helper (adapted from snn_live_slam.py)
@@ -357,6 +357,7 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
     hover_params_single = jax.tree.map(lambda x: x[0], hover_fixed_params) if hover_fixed_params is not None else None
     
     slam_prev_int = np.zeros(N_PIXELS, dtype=np.float32)
+    vis_prev_int = np.zeros(N_PIXELS, dtype=np.float32)  # separate buffer for high-freq DVS display
     ev_jax = jnp.zeros((1, 256))
 
     # Real Spiking Occupancy Grid
@@ -528,7 +529,18 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
         sim_data['active_places'].append(last_active_places)
         sim_data['slam_est'].append((slam_est_u, slam_est_v, slam_est_th))
         sim_data['surprise'].append(last_slam_surprise)
-        sim_data['events'].append(np.array(ev_jax[0])) # store raw high-freq events for visualization
+        # Compute events at every frame (463 Hz) for smooth DVS display
+        _vis_slam_pos = jnp.array([slam_u, slam_v])
+        _vis_int, _, _, _ = compute_pixel_readings(
+            _vis_slam_pos, sensor_heading, env._segments,
+            obstacles=env._obstacles, tex_tensor=env._tex_tensor,
+        )
+        _vis_int_np = np.array(_vis_int)
+        _vis_delta = _vis_int_np - vis_prev_int
+        _vis_events = np.where(_vis_delta > THRESHOLD, 1.0,
+                     np.where(_vis_delta < -THRESHOLD, -1.0, 0.0)).astype(np.float32)
+        vis_prev_int = _vis_int_np
+        sim_data['events'].append(_vis_events)
         sim_data['alpha'].append(float(alpha_floored_jax.squeeze()))
         sim_data['f_repel'].append(float(jnp.linalg.norm(f_repel_scaled_jax.squeeze())))
         sim_data['flow_corr'].append(float(flow_corr_jax.squeeze()))
@@ -1533,7 +1545,7 @@ def train():
         # Run SLAM steps (closed-loop with full memory + loop closure detection)
         # 3 steps (3 x 0.02s = 0.06s) align the SLAM time-scale with the 32-step physical horizon (0.069s)
         try:
-            kin_jax_scaled = kin_jax * 0.096
+            kin_jax_scaled = kin_jax * 1.152
             for _ in range(3):
                 pose_est, _, _, _, _, debug_gates = slam_system.forward_step(
                     ev_jax, kin_jax_scaled, tof_jax, acc_t=acc_jax,
