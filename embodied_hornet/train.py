@@ -1239,7 +1239,7 @@ def train():
             min_obs_dists = jax.vmap(_signed_dist)(cur_su, cur_sz)  # (B,)
             # Penalty: activated inside safety margin (0.5 SLAM units ≈5 cm physical)
             obs_violation = jax.nn.relu(Config.OBS_SAFETY_SLAM - min_obs_dists)  # (B,)
-            obs_penalty   = -Config.OBS_PENALTY_WEIGHT * obs_violation           # (B,)
+            obs_penalty   = Config.OBS_PENALTY_WEIGHT * obs_violation            # (B,)
 
             # --- SCALE Force ---
             raw_diff = u_brain[:, :3] - f_actual[:, :3]
