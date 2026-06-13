@@ -1481,7 +1481,7 @@ def train():
         Resets and re-initialises the SLAM tracker to match the fresh spawn position,
         without regenerating the obstacle distribution of the arena.
         """
-        nonlocal slam_prev_int, slam_vis_csnn, slam_vis_stdp, sog_state
+        nonlocal slam_prev_int, slam_vis_csnn, slam_vis_stdp
         env._prev_robot_state = None
         r0 = np.array(curr_agent0_state)
         new_slam_x  = float(r0[0]) * env._slam_scale + 1.0
@@ -1496,7 +1496,6 @@ def train():
         slam_prev_int = np.zeros(N_PIXELS, dtype=np.float32)
         slam_vis_csnn = jnp.zeros(256)
         slam_vis_stdp = jnp.zeros(256)
-        sog_state = sog_system.init_state()
 
         new_slam_pose = jnp.array([new_slam_x, new_slam_z, new_slam_th])
         print(f"    [SLAM RESET ON CRASH] Re-initialized at ({new_slam_x:.2f}, {new_slam_z:.2f}) m")
