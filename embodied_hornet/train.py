@@ -477,15 +477,13 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
             
             # SLAM tracking for visualization - run once per 10 steps (50Hz)
             env._prev_robot_state = r_st_start_10
-            ev_jax, _, tof_jax, acc_jax, slam_prev_int = env.compute_slam_sensors(
+            ev_jax, kin_jax, tof_jax, acc_jax, slam_prev_int = env.compute_slam_sensors(
                 r_state_np, slam_prev_int, dt=elapsed_time
             )
             
-            avg_kin = kin_acc / max(1, kin_count)
-            
             try:
                 pose_est, _, _, _, _, debug_gates = vis_slam.forward_step(
-                    ev_jax, jnp.array([avg_kin]), tof_jax,
+                    ev_jax, kin_jax, tof_jax,
                     acc_t=acc_jax,
                     inject_drift=False, autopilot_on=(last_slam_surprise < 0.60),
                     dt=elapsed_time
