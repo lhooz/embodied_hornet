@@ -357,6 +357,7 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
     hover_params_single = jax.tree.map(lambda x: x[0], hover_fixed_params) if hover_fixed_params is not None else None
     
     slam_prev_int = np.zeros(N_PIXELS, dtype=np.float32)
+    ev_jax = jnp.zeros((1, 256))
 
     # Real Spiking Occupancy Grid
     from snn_slam_system import SpikingOccupancyGrid
@@ -381,6 +382,7 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
     vis_emd_intensities = jnp.zeros((1, Config.N_EMD_PIX))
 
     for i in range(total_visual_frames):
+        r_st_start = np.array(state[0][0])
         for _ in range(steps_per_frame):
             r_st = state[0]
             r_cpu = np.array(r_st[0])
@@ -431,17 +433,19 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
         sim_data['tof'].append(np.array(_tof_jax))
         sim_data['heading'].append(sensor_heading)
 
-        # SLAM tracking for visualization
-        ev_jax, kin_jax, tof_jax, acc_jax, slam_prev_int = env.compute_slam_sensors(
-            r_state_np, slam_prev_int, dt=physics_dt
-        )
-        
-        # Accumulate high-frequency events and kinematics for the 50Hz CANN SLAM
-        ev_acc += np.array(ev_jax[0])
-        kin_acc += np.array(kin_jax[0])
-        acc_acc += np.array(acc_jax[0])
+        # Accumulate kinematics at high frequency (115Hz) to prevent aliasing
+        cos_sh = np.cos(sensor_heading)
+        sin_sh = np.sin(sensor_heading)
+        vx_sensor = (r_state_np[4] * cos_sh + r_state_np[5] * sin_sh) * env._slam_scale
+        vz_sensor = (-r_state_np[4] * sin_sh + r_state_np[5] * cos_sh) * env._slam_scale
+        w_theta = r_state_np[6]
+        kin_acc += np.array([vx_sensor, vz_sensor, w_theta], dtype=np.float32)
         kin_count += 1
-        
+
+        # Capture the starting state at the beginning of the 10-step block
+        if i % 10 == 0:
+            r_st_start_10 = np.array(r_st_start)
+
         # Dead-reckoning position integrator (high frequency)
         dr_vx = float(r_state_np[4]) * env._slam_scale
         dr_vz = float(r_state_np[5]) * env._slam_scale
@@ -472,17 +476,21 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
 
         # Trigger CANN update exactly every 10 steps to align time-scales and eliminate timing jitter
         if (i + 1) % 10 == 0:
-            # Still run the CANN pipeline for place cell mapping at 50Hz (bio-faithful)
-            avg_kin = kin_acc / max(1, kin_count)
-            avg_ev = np.clip(ev_acc, -1.0, 1.0)
-            avg_acc = acc_acc / max(1, kin_count)
             elapsed_time = 10 * physics_dt
+            
+            # SLAM tracking for visualization - run once per 10 steps (50Hz)
+            env._prev_robot_state = r_st_start_10
+            ev_jax, _, tof_jax, acc_jax, slam_prev_int = env.compute_slam_sensors(
+                r_state_np, slam_prev_int, dt=elapsed_time
+            )
+            
+            avg_kin = kin_acc / max(1, kin_count)
             
             try:
                 scale_factor = elapsed_time / CANN_DT
                 pose_est, _, _, _, _, debug_gates = vis_slam.forward_step(
-                    jnp.array([avg_ev]), jnp.array([avg_kin * scale_factor]), tof_jax,
-                    acc_t=jnp.array([avg_acc]),
+                    ev_jax, jnp.array([avg_kin * scale_factor]), tof_jax,
+                    acc_t=acc_jax,
                     inject_drift=False, autopilot_on=(last_slam_surprise < 0.60)
                 )
                 last_slam_surprise = float(1.0 - float(debug_gates['Raw_Match'][0]))
@@ -511,9 +519,7 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
                 last_active_places = np.array([], dtype=np.int32)
             
             # Reset accumulators
-            ev_acc = np.zeros(256, dtype=np.float32)
             kin_acc = np.zeros(3, dtype=np.float32)
-            acc_acc = np.zeros(2, dtype=np.float32)
             kin_count = 0
 
         if (i + 1) % 10 == 0 or i == 0:
@@ -1520,13 +1526,14 @@ def train():
         # 1b. SLAM update (outside JIT, runs on agent-0's terminal state)
         # Compute sensor bundle from the final state of this horizon
         robot0_np = np.array(next_state[0][0])  # (8,) agent-0 hornet state
+        env._prev_robot_state = np.array(curr_state[0][0])
         ev_jax, kin_jax, tof_jax, acc_jax, slam_prev_int = env.compute_slam_sensors(
             robot0_np, slam_prev_int, dt=Config.HORIZON * Config.SIM_SUBSTEPS * Config.DT
         )
         # Run SLAM steps (closed-loop with full memory + loop closure detection)
         # 3 steps (3 x 0.02s = 0.06s) align the SLAM time-scale with the 32-step physical horizon (0.069s)
         try:
-            kin_jax_scaled = kin_jax * 1.152
+            kin_jax_scaled = kin_jax * 0.096
             for _ in range(3):
                 pose_est, _, _, _, _, debug_gates = slam_system.forward_step(
                     ev_jax, kin_jax_scaled, tof_jax, acc_t=acc_jax,
