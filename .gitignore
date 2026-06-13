@@ -21,7 +21,7 @@ dist/
 .vscode/
 
 # Local debug scripts
-debug_scripts/
+scratch/
 
 # Training outputs (checkpoint PKLs excluded; hover_params is a tracked asset)
 checkpoints_shac/
