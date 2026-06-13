@@ -128,6 +128,8 @@ class Config:
     K_FLOW = 0.3         # HS centering reflex gain (Dorsal stream — pitch torque)
     K_LOOM = 0.1         # LGMD looming escape gain (Dorsal stream — forward deceleration)
     N_EMD_PIX = 32       # Coarse ommatidial array resolution (Dorsal stream)
+    EMD_TAU_BASE = 0.05       # Base EMD delay time constant (seconds) at 0 speed
+    EMD_TAU_SPEED_GAIN = 2.0  # Gain for speed-adaptive EMD delay reduction
     
     # --- PBT Hyperparameters ---
     PBT_BASE_WEIGHTS = jnp.array([
@@ -185,7 +187,8 @@ def actor_critic_fn(combined_state, action_noise=None, SOG_v_mem=None, K_repel=0
         emd_signals=emd_signals,
         K_flow=K_flow,
         K_loom=K_loom,
-        robot_pos_slam=robot_pos_slam
+        robot_pos_slam=robot_pos_slam,
+        dynamic_gains=True
     )
     
     # 4. Critic evaluates the unified 12-dimensional observation
@@ -219,7 +222,8 @@ def hover_actor_fn(physical_state, action_noise=None, SOG_v_mem=None, K_repel=0.
         emd_signals=emd_signals,
         K_flow=K_flow,
         K_loom=K_loom,
-        robot_pos_slam=robot_pos_slam
+        robot_pos_slam=robot_pos_slam,
+        dynamic_gains=False
     )
     # Critic on 8D state (matching hover_params.pkl structure)
     value = hk.Sequential([
@@ -1131,8 +1135,18 @@ def train():
             curr_emd_intensities, _ = jax.vmap(compute_emd_intensities, in_axes=(0, 0, None))(
                 slam_pos_batch, sensor_heading_batch, env._segments
             )
-            # 2. Reichardt correlate + LPTC pool: centering (HS) + looming (LGMD)
-            emd_signals = jax.vmap(compute_emd_signals)(prev_emd_intensities, curr_emd_intensities)
+            # 2. Speed-dependent temporal frequency adaptation
+            vx = curr_robot[:, 4]
+            vz = curr_robot[:, 5]
+            speed = jnp.sqrt(vx**2 + vz**2 + 1e-8)
+            tau = Config.EMD_TAU_BASE / (1.0 + Config.EMD_TAU_SPEED_GAIN * speed)
+            emd_dt = Config.DT * Config.SIM_SUBSTEPS
+            alpha_adaptive = jnp.exp(-emd_dt / tau)
+            
+            # 3. Reichardt correlate + LPTC pool: centering (HS) + looming (LGMD)
+            emd_signals = jax.vmap(compute_emd_signals, in_axes=(0, 0, 0))(
+                prev_emd_intensities, curr_emd_intensities, alpha_adaptive
+            )
 
             # 3. Policy Inference
             batched_network = jax.vmap(ac_model.apply, in_axes=(0, 0, 0, None, None, 0, None, None, 0))
@@ -1675,7 +1689,17 @@ def vis_step_fn(env, curr_state, curr_params, step_idx, slam_surprise, hover_par
     curr_emd_intensities, _ = jax.vmap(compute_emd_intensities, in_axes=(0, 0, None))(
         slam_pos_batch, sensor_heading_batch, env._segments
     )
-    emd_signals = jax.vmap(compute_emd_signals)(prev_emd_intensities, curr_emd_intensities)
+    # Speed-dependent temporal frequency adaptation
+    vx = r_st[:, 4]
+    vz = r_st[:, 5]
+    speed = jnp.sqrt(vx**2 + vz**2 + 1e-8)
+    tau = Config.EMD_TAU_BASE / (1.0 + Config.EMD_TAU_SPEED_GAIN * speed)
+    emd_dt = Config.DT * Config.SIM_SUBSTEPS
+    alpha_adaptive = jnp.exp(-emd_dt / tau)
+    
+    emd_signals = jax.vmap(compute_emd_signals, in_axes=(0, 0, 0))(
+        prev_emd_intensities, curr_emd_intensities, alpha_adaptive
+    )
 
     # 3. Policy Inference
     mods, _, _ = ac_model.apply(

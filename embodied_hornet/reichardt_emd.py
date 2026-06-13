@@ -192,7 +192,7 @@ def pool_lptc(local_flow):
     return jnp.array([centering, looming])
 
 
-def compute_emd_signals(prev_intensities, curr_intensities):
+def compute_emd_signals(prev_intensities, curr_intensities, alpha=None):
     """
     Full dorsal stream pipeline: intensities → EMD flow → LPTC signals.
     
@@ -202,10 +202,11 @@ def compute_emd_signals(prev_intensities, curr_intensities):
     Args:
         prev_intensities:  (N_EMD_PIX,) previous frame ommatidial intensities
         curr_intensities:  (N_EMD_PIX,) current frame ommatidial intensities
+        alpha:             optional dynamic EMA smoothing factor
     
     Returns:
         signals:  (2,) [centering_signal, looming_signal]
     """
-    local_flow = reichardt_correlate(prev_intensities, curr_intensities)
+    local_flow = reichardt_correlate(prev_intensities, curr_intensities, alpha=alpha)
     signals = pool_lptc(local_flow)
     return signals

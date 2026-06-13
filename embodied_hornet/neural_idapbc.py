@@ -10,6 +10,7 @@ Imports all base classes from the hornetRL submodule and adds:
 import jax
 import jax.numpy as jnp
 from functools import partial
+import haiku as hk
 
 # --- ALL BASE CLASSES FROM hornetRL SUBMODULE (unmodified) ---
 from hornetRL.neural_idapbc import (
@@ -55,7 +56,8 @@ def compute_sog_repulsive_force(robot_pos_slam, SOG_v_mem, map_size=2.0):
     return force
 
 def policy_network_icnn(x, target_state=None, action_noise=None, SOG_v_mem=None, K_repel=0.0,
-                        emd_signals=None, K_flow=0.0, K_loom=0.0, robot_pos_slam=None):
+                        emd_signals=None, K_flow=0.0, K_loom=0.0, robot_pos_slam=None,
+                        dynamic_gains=True):
     """
     Full Policy Pipeline: Brain -> Muscles (Enhanced with SOG & EMD avoidance).
     
@@ -72,10 +74,26 @@ def policy_network_icnn(x, target_state=None, action_noise=None, SOG_v_mem=None,
     
     # Apply "Volume Knobs" (Sensitivity Gains)
     x_in = x * ScaleConfig.OBS_SCALE
-
+ 
     # 1. THE BRAIN (Compute Generalized Forces)
     brain = NeuralIDAPBC_ICNN(target_state)
     u_forces_newtons = brain(x_in)
+ 
+    # 1b. Predict dynamic neuromodulatory gains (using x, the raw 8D physical state)
+    # This must be done outside the emd_signals conditional so that Haiku can
+    # initialize the neuromodulator parameters during ac.init (where emd_signals=None).
+    if dynamic_gains:
+        net_K = hk.Sequential([
+            hk.Linear(16, name="neuromod_1"), jax.nn.tanh,
+            hk.Linear(2, name="neuromod_2")
+        ])
+        raw_K = net_K(x)
+        
+        # Map to positive bounded ranges:
+        scale_flow = jnp.where(K_flow > 0.0, K_flow, 1.0)
+        scale_loom = jnp.where(K_loom > 0.0, K_loom, 1.0)
+        K_flow_dyn = jax.nn.sigmoid(raw_K[..., 0]) * 1.0 * scale_flow
+        K_loom_dyn = jax.nn.sigmoid(raw_K[..., 1]) * 0.5 * scale_loom
 
     # 2. Inject Hassenstein-Reichardt EMD reflexes (Dorsal pathway — LPTC)
     #    emd_signals[..., 0] = HS centering: left-vs-right flow differential
@@ -83,10 +101,16 @@ def policy_network_icnn(x, target_state=None, action_noise=None, SOG_v_mem=None,
     if emd_signals is not None:
         centering = emd_signals[..., 0]
         looming   = emd_signals[..., 1]
-        # HS-cell centering: pitch torque correction (steer away from approaching side)
-        u_forces_newtons = u_forces_newtons.at[..., 2].add(K_flow * centering)
-        # LGMD looming escape: forward deceleration (brake when total expansion is high)
-        u_forces_newtons = u_forces_newtons.at[..., 0].add(-K_loom * looming)
+        if dynamic_gains:
+            # HS-cell centering: pitch torque correction (steer away from approaching side)
+            u_forces_newtons = u_forces_newtons.at[..., 2].add(K_flow_dyn * centering)
+            # LGMD looming escape: forward deceleration (brake when total expansion is high)
+            u_forces_newtons = u_forces_newtons.at[..., 0].add(-K_loom_dyn * looming)
+        else:
+            # HS-cell centering: pitch torque correction (steer away from approaching side)
+            u_forces_newtons = u_forces_newtons.at[..., 2].add(K_flow * centering)
+            # LGMD looming escape: forward deceleration (brake when total expansion is high)
+            u_forces_newtons = u_forces_newtons.at[..., 0].add(-K_loom * looming)
 
     # 3. Inject SOG repulsive forces (Ventral pathway)
     if SOG_v_mem is not None:
