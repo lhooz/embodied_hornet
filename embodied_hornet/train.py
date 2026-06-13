@@ -120,7 +120,7 @@ class Config:
     ACTION_NOISE_SIGMA = 0.2
 
     TOTAL_UPDATES = 100000
-    VIS_INTERVAL = 200
+    VIS_INTERVAL = 100
     CURRICULUM_RATIO = 0.5
     
     # --- Obstacle Avoidance Gains ---
@@ -147,7 +147,7 @@ class Config:
     CKPT_DIR = "checkpoints_shac"
     VIS_DIR = "checkpoints_shac"
     AUX_LOSS_WEIGHT = 1.0
-    VIS_INTERVAL = 200
+    VIS_INTERVAL = 100
 
     # --- Obstacle Collision ---
     OBS_PENALTY_WEIGHT = 50.0   # reward penalty per SLAM unit of penetration
@@ -238,8 +238,9 @@ hover_ac_model = hk.without_apply_rng(hk.transform(hover_actor_fn))
 # ==============================================================================
 # 3. VISUALIZATION ENGINE
 # ==============================================================================
-def run_visualization(env, params, update_idx, vis_step_fn):
+def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr_state=None, slam_system=None, sog_state=None, target_xy=None, slam_pose=None, slam_surprise=0.0):
     print(f"--> Generating Visualization for Step {update_idx}...")
+    import copy
 
     steps_per_frame = 1
     total_visual_frames = Config.HORIZON * 8
@@ -268,31 +269,84 @@ def run_visualization(env, params, update_idx, vis_step_fn):
     acc_acc = np.zeros(2, dtype=np.float32)
     kin_count = 0
     
-    last_slam_est_u = 0.0
-    last_slam_est_v = 0.0
-    last_slam_est_th = 0.0
+    best_idx = 0
+    if pbt_state is not None:
+        best_idx = int(np.argmax(pbt_state.running_reward))
+        print(f"    -> Visualizing Best Agent (index {best_idx}) with reward {pbt_state.running_reward[best_idx]:.2f}")
+    
+    # Extract the best agent's parameters
+    params_single = jax.tree.map(lambda x: x[best_idx], params)
+    
+    # Extract the best agent's state or reset if not provided
+    if curr_state is not None:
+        state = jax.tree.map(lambda x: x[best_idx : best_idx + 1], curr_state)
+        print(f"    -> Resuming from exploration history (spawn pose: {state[0][0, :3]})")
+    else:
+        rng = jax.random.PRNGKey(update_idx)
+        state = env.reset(rng, 1)
+        r_state_override = state[0].at[0].set(Config.TARGET_STATE)
+        state = (r_state_override,) + state[1:]
+
+    # Copy the SLAM system if provided, otherwise create a new one
+    if slam_system is not None:
+        vis_slam = copy.deepcopy(slam_system)
+        if best_idx != 0:
+            # We must reset and initialize the pose tracker to match the best agent's spawn position
+            r_state_np_start = np.array(state[0][0])
+            start_slam_x = float(r_state_np_start[0]) * env._slam_scale + 1.0
+            start_slam_z = float(r_state_np_start[1]) * env._slam_scale + 1.0
+            start_slam_th = float(r_state_np_start[2]) - 1.0  # sensor heading
+            
+            vis_slam.reset_pose_only(1)
+            vis_slam.initialize_pose(
+                jnp.array([[start_slam_x, start_slam_z]]),
+                jnp.array([start_slam_th]),
+            )
+            last_slam_est_u = start_slam_x
+            last_slam_est_v = start_slam_z
+            last_slam_est_th = start_slam_th
+            print(f"    -> Deepcopied SLAM system but reset & re-initialized pose to best agent ({best_idx}) start: ({last_slam_est_u:.2f}, {last_slam_est_v:.2f})")
+        else:
+            last_slam_est_u = float(slam_pose[0])
+            last_slam_est_v = float(slam_pose[1])
+            last_slam_est_th = float(slam_pose[2])
+            print(f"    -> Deepcopied SLAM system from training run at pose ({last_slam_est_u:.2f}, {last_slam_est_v:.2f})")
+    else:
+        from snn_slam_system import SNNSLAMSystem
+        vis_slam = SNNSLAMSystem(jax.random.PRNGKey(update_idx + 999), n_depth=N_DEPTH)
+        vis_slam.reset(1)
+        
+        r_state_np_start = np.array(state[0][0])
+        start_slam_x = float(r_state_np_start[0]) * env._slam_scale + 1.0
+        start_slam_z = float(r_state_np_start[1]) * env._slam_scale + 1.0
+        start_slam_th = float(r_state_np_start[2]) - 1.0  # sensor heading
+        env._prev_robot_state = None
+        vis_slam.initialize_pose(
+            jnp.array([[start_slam_x, start_slam_z]]),
+            jnp.array([start_slam_th]),
+        )
+        last_slam_est_u = start_slam_x
+        last_slam_est_v = start_slam_z
+        last_slam_est_th = start_slam_th
+
+    dr_x = last_slam_est_u
+    dr_z = last_slam_est_v
+    dr_th = last_slam_est_th
+    raw_imu_x = last_slam_est_u
+    raw_imu_z = last_slam_est_v
+    raw_imu_th = last_slam_est_th
+    slam_est_u = last_slam_est_u
+    slam_est_v = last_slam_est_v
+    slam_est_th = last_slam_est_th
+
     last_active_places = np.array([], dtype=np.int32)
-    last_slam_surprise = 0.0
+    last_slam_surprise = float(slam_surprise) if slam_surprise is not None else 0.0
     slam_vis_csnn_jax = jnp.zeros((1, 256))
     slam_vis_stdp_jax = jnp.zeros((1, 256))
     
-    rng = jax.random.PRNGKey(update_idx)
-    state = env.reset(rng, 1) 
-    
-    # Force the visualization agent to start exactly at nominal hover target (center of the room, zero velocity)
-    # to guarantee a clean start and provide the maximum safety buffer (1.0m) to the boundaries.
-    r_state_override = state[0].at[0].set(Config.TARGET_STATE)
-    state = (r_state_override,) + state[1:]
-    
     active_props_batch = state[3] 
     real_props = jax.tree.map(lambda x: x[0], active_props_batch)
-    params_single = jax.tree.map(lambda x: x[0], params)
 
-    # Initialize a clean SLAM system for tracking in visualization
-    from snn_slam_system import SNNSLAMSystem
-    vis_slam = SNNSLAMSystem(jax.random.PRNGKey(update_idx + 999), n_depth=N_DEPTH)
-    vis_slam.reset(1)
-    
     # Load hover specialist for stabilizing visual rollout via DNAG blending
     _hover_pkl = os.path.join(os.path.dirname(__file__), "hover_params.pkl")
     hover_fixed_params = None
@@ -301,41 +355,27 @@ def run_visualization(env, params, update_idx, vis_step_fn):
             _hover_ckpt = pickle.load(_f)
         hover_fixed_params = jax.tree.map(jnp.array, _hover_ckpt['params'])
     hover_params_single = jax.tree.map(lambda x: x[0], hover_fixed_params) if hover_fixed_params is not None else None
-
-    r_state_np_start = np.array(state[0][0])
-    start_slam_x = float(r_state_np_start[0]) * env._slam_scale + 1.0
-    start_slam_z = float(r_state_np_start[1]) * env._slam_scale + 1.0
-    start_slam_th = float(r_state_np_start[2]) - 1.0  # sensor heading
-    env._prev_robot_state = None
-    vis_slam.initialize_pose(
-        jnp.array([[start_slam_x, start_slam_z]]),
-        jnp.array([start_slam_th]),
-    )
-    
-    last_slam_est_u = start_slam_x
-    last_slam_est_v = start_slam_z
-    last_slam_est_th = start_slam_th
-    dr_x = start_slam_x
-    dr_z = start_slam_z
-    dr_th = start_slam_th
-    raw_imu_x = start_slam_x
-    raw_imu_z = start_slam_z
-    raw_imu_th = start_slam_th
-    slam_est_u = start_slam_x
-    slam_est_v = start_slam_z
-    slam_est_th = start_slam_th
     
     slam_prev_int = np.zeros(N_PIXELS, dtype=np.float32)
 
-    # Real Spiking Occupancy Grid — LIF neuron sheet (from snn_slam_system)
-    # 50×50 grid covering 10m×10m SLAM space at 0.2m/cell resolution.
-    # v_max=1.0: clamp membrane potential at spike threshold so the heatmap stays
-    # meaningful — cells that fire repeatedly saturate at 1.0 (walls/obstacles),
-    # cleared free-space cells are inhibited to negative values.
-    _sog = SpikingOccupancyGrid(map_size_m=2.0, res=0.04, offset_m=0.0, v_max=1.0)  # 50×50 grid, 4cm/cell, 2m room
-    _sog_state = _sog.init_state()
+    # Real Spiking Occupancy Grid
+    from snn_slam_system import SpikingOccupancyGrid
+    _sog = SpikingOccupancyGrid(map_size_m=2.0, res=0.04, offset_m=0.0, v_max=1.0)
+    if sog_state is not None:
+        _sog_state = sog_state
+        print("    -> Loaded SOG state from training run.")
+    else:
+        _sog_state = _sog.init_state()
+
     _TOF_ANGLES = [-np.pi/4, 0.0, np.pi/4]
     sim_data['sog_states'] = []  # per-frame v_mem snapshots for animation replay
+
+    # Target waypoint: if target_xy is provided, use the best agent's active target
+    if target_xy is not None:
+        vis_target_xy = target_xy[best_idx : best_idx + 1]
+        print(f"    -> Using best agent's target waypoint: {vis_target_xy}")
+    else:
+        vis_target_xy = jnp.array([[0.5, -0.5]])
 
     current_step_counter = 0
     vis_emd_intensities = jnp.zeros((1, Config.N_EMD_PIX))
@@ -350,7 +390,6 @@ def run_visualization(env, params, update_idx, vis_step_fn):
             
             slam_pose_jax = jnp.array([[slam_est_u, slam_est_v, slam_est_th]])
             vis_step_idx = current_step_counter + Config.WARMUP_STEPS + 5
-            vis_target_xy = jnp.array([[0.5, -0.5]])  # target waypoint for visualization
             state, f_nodal, w_pose, h_marker, alpha_floored_jax, f_repel_scaled_jax, flow_corr_jax, vis_emd_intensities = vis_step_fn(
                 env, state, params_single, vis_step_idx, jnp.array([last_slam_surprise]), hover_params_single, slam_pose_jax, slam_vis_csnn_jax, slam_vis_stdp_jax, _sog_state.v_mem, Config.K_REPEL, Config.K_FLOW, vis_target_xy, vis_emd_intensities
             )
@@ -556,8 +595,8 @@ def run_visualization(env, params, update_idx, vis_step_fn):
         ax_nav.add_patch(p)
         obs_patch_list.append((obs, p))
 
-    # Draw target in SLAM coords (using off-center target node [0.5, -0.5])
-    target_phys = np.array([0.5, -0.5])
+    # Draw target in SLAM coords using best agent's active target
+    target_phys = np.array(vis_target_xy[0])
     _slam_scale = env._slam_scale
     _slam_offset = 1.0
     tgt_u = target_phys[0] * _slam_scale + _slam_offset
@@ -1646,7 +1685,16 @@ def train():
                     'pbt_state': pbt_state 
                 }, f)
             print(f"--> Saved Checkpoint: {ckpt_path}")
-            run_visualization(env, params, i, vis_step_fn)
+            run_visualization(
+                env, params, i, vis_step_fn,
+                pbt_state=pbt_state,
+                curr_state=curr_state,
+                slam_system=slam_system,
+                sog_state=sog_state,
+                target_xy=target_xy,
+                slam_pose=slam_pose,
+                slam_surprise=slam_surprise
+            )
 
 # Global Visualization Step
 @partial(jax.jit, static_argnums=(0,))
