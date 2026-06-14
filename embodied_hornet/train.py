@@ -759,11 +759,15 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
         spine.set_edgecolor('#444444')
         
     line_repel, = ax_telemetry_right.plot(time_series, sim_data['f_repel'], '-', color='#ff33ff', linewidth=1.2, label='SOG Repulsion')
+    line_emd, = ax_telemetry_right.plot(time_series, sim_data['flow_corr'], '-', color='#39ff14', linewidth=1.2, label='EMD Centering')
+    
     max_repel = max(sim_data['f_repel']) if sim_data['f_repel'] else 1.0
-    ax_telemetry_right.set_ylim(-0.05 * max_repel, max_repel * 1.1 + 1e-3)
-    ax_telemetry_right.set_ylabel('SOG Repulsion (N)', color='#ff33ff', fontsize=8)
+    max_emd = max(abs(x) for x in sim_data['flow_corr']) if sim_data['flow_corr'] else 1.0
+    max_val = max(max_repel, max_emd)
+    ax_telemetry_right.set_ylim(-max_val * 1.1 - 1e-3, max_val * 1.1 + 1e-3)
+    ax_telemetry_right.set_ylabel('SOG Repel (N) / EMD Centering', color='#cccccc', fontsize=8)
 
-    lines = [line_surprise, line_alpha, line_repel]
+    lines = [line_surprise, line_alpha, line_repel, line_emd]
     labels = [l.get_label() for l in lines]
     ax_telemetry.legend(lines, labels, loc='upper left', facecolor='#222222', labelcolor='white', fontsize=7)
     
