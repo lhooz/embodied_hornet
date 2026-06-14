@@ -115,6 +115,7 @@ class Config:
     GAMMA = 0.99
     DNAG_MIN_ALPHA = 0.3        # hover specialist always contributes ≥30% of the blend
                                 # prevents SHAC's random critic from destroying hover stability
+    DNAG_MAX_SURPRISE = 0.4     # clamp surprise to 0.4 to prevent gate saturation at 1.0
 
     OBS_NOISE_SIGMA = 0.002  
     ACTION_NOISE_SIGMA = 0.2
@@ -217,12 +218,12 @@ def hover_actor_fn(physical_state, action_noise=None, SOG_v_mem=None, K_repel=0.
         physical_state,
         target_state=target_sym,
         action_noise=action_noise,
-        SOG_v_mem=SOG_v_mem,
-        K_repel=K_repel,
-        emd_signals=emd_signals,
-        K_flow=K_flow,
-        K_loom=K_loom,
-        robot_pos_slam=robot_pos_slam,
+        SOG_v_mem=None,
+        K_repel=0.0,
+        emd_signals=None,
+        K_flow=0.0,
+        K_loom=0.0,
+        robot_pos_slam=None,
         dynamic_gains=False
     )
     # Critic on 8D state (matching hover_params.pkl structure)
@@ -1206,8 +1207,8 @@ def train():
             )
             
             # --- LYAPUNOV HOVER & ATTENTION GATING (DNAG) ---
-            # Use real SLAM surprise (frozen for this 32-step horizon).
-            sim_surprise = frozen_surp
+            # Use real SLAM surprise (frozen for this 32-step horizon) and clamp to prevent gate saturation.
+            sim_surprise = jnp.minimum(frozen_surp, Config.DNAG_MAX_SURPRISE)
 
             # Hover modulations: dedicated hover specialist (trained ICNN + BiologicalKinematicMap).
             # hover_fixed_params is closed over and treated as a constant by JAX JIT —
@@ -1763,7 +1764,8 @@ def vis_step_fn(env, curr_state, curr_params, step_idx, slam_surprise, hover_par
     )
     
     # --- LYAPUNOV HOVER & ATTENTION GATING (DNAG) ---
-    sim_surprise = slam_surprise
+    # Clamp surprise to prevent gate saturation.
+    sim_surprise = jnp.minimum(slam_surprise, Config.DNAG_MAX_SURPRISE)
     
     if hover_params_single is not None:
         hover_mods, _, _ = hover_ac_model.apply(
