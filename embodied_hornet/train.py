@@ -415,7 +415,7 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
             break
 
         sim_data['states'].append(r_state_np)
-        sim_data['t'].append(current_step_counter * Config.DT)
+        sim_data['t'].append(current_step_counter * Config.DT * Config.SIM_SUBSTEPS)
         # Convert physical (x, z) → SLAM (u, v) for nav panel
         _slam_scale  = env._slam_scale
         _slam_offset = 1.0

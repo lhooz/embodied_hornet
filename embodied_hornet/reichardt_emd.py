@@ -189,7 +189,11 @@ def pool_lptc(local_flow):
     # Apply soft rectification (ReLU-like) to emphasise strong signals
     looming = jnp.mean(jnp.abs(local_flow))
     
-    return jnp.array([centering, looming])
+    # Scale pooled signals to map them into a physically meaningful control range of [-1.0, 1.0]
+    centering_scaled = centering * 50.0
+    looming_scaled = looming * 200.0
+    
+    return jnp.array([centering_scaled, looming_scaled])
 
 
 def compute_emd_signals(prev_intensities, curr_intensities, alpha=None):
