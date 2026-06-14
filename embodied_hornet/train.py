@@ -754,18 +754,32 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
 
     ax_telemetry_right = ax_telemetry.twinx()
     ax_telemetry_right.set_facecolor('none')
-    ax_telemetry_right.tick_params(colors='#aaaaaa', labelsize=8)
+    ax_telemetry_right.tick_params(colors='#ff33ff', labelsize=8)
     for spine in ax_telemetry_right.spines.values():
         spine.set_edgecolor('#444444')
         
     line_repel, = ax_telemetry_right.plot(time_series, sim_data['f_repel'], '-', color='#ff33ff', linewidth=1.2, label='SOG Repulsion')
-    line_emd, = ax_telemetry_right.plot(time_series, sim_data['flow_corr'], '-', color='#39ff14', linewidth=1.2, label='EMD Centering')
-    
     max_repel = max(sim_data['f_repel']) if sim_data['f_repel'] else 1.0
+    if max_repel <= 0.0: max_repel = 1.0
+    ax_telemetry_right.set_ylim(-0.05 * max_repel, max_repel * 1.1)
+    ax_telemetry_right.set_ylabel('SOG Repel (N)', color='#ff33ff', fontsize=8)
+
+    ax_telemetry_right2 = ax_telemetry.twinx()
+    ax_telemetry_right2.spines['right'].set_position(('outward', 45))
+    ax_telemetry_right2.set_facecolor('none')
+    ax_telemetry_right2.tick_params(colors='#39ff14', labelsize=8)
+    for spine_name, spine in ax_telemetry_right2.spines.items():
+        if spine_name == 'right':
+            spine.set_visible(True)
+            spine.set_edgecolor('#444444')
+        else:
+            spine.set_visible(False)
+            
+    line_emd, = ax_telemetry_right2.plot(time_series, sim_data['flow_corr'], '-', color='#39ff14', linewidth=1.2, label='EMD Centering')
     max_emd = max(abs(x) for x in sim_data['flow_corr']) if sim_data['flow_corr'] else 1.0
-    max_val = max(max_repel, max_emd)
-    ax_telemetry_right.set_ylim(-max_val * 1.1 - 1e-3, max_val * 1.1 + 1e-3)
-    ax_telemetry_right.set_ylabel('SOG Repel (N) / EMD Centering', color='#cccccc', fontsize=8)
+    if max_emd <= 0.0: max_emd = 1.0
+    ax_telemetry_right2.set_ylim(-max_emd * 1.1, max_emd * 1.1)
+    ax_telemetry_right2.set_ylabel('EMD Centering', color='#39ff14', fontsize=8)
 
     lines = [line_surprise, line_alpha, line_repel, line_emd]
     labels = [l.get_label() for l in lines]
@@ -958,6 +972,8 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
     ani.save(out_file, writer='pillow', fps=60)
     plt.close(fig)
     print(f"--> Saved Viz: {out_file}")
+    f_repel_arr = np.array(sim_data['f_repel'])
+    print(f"DEBUG f_repel stats: mean={f_repel_arr.mean():.6f}, max={f_repel_arr.max():.6f}, non-zero count={(f_repel_arr > 0.0).sum()}/{len(f_repel_arr)}")
 
 # ==============================================================================
 # 4. TRAINING LOOP
