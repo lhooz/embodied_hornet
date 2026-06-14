@@ -38,9 +38,9 @@ def compute_sog_repulsive_force(robot_pos_slam, SOG_v_mem, map_size=2.0):
     # Only consider obstacles/walls (membrane potential > 0)
     active_mask = jnp.maximum(SOG_v_mem, 0.0)  # (..., N, N) or (N, N)
     
-    # Local influence cutoff (e.g. 0.25 meters) to prevent long-range gravitation-like pulling
+    # Local influence cutoff (e.g. 0.15 meters) to prevent long-range gravitation-like pulling
     # We use a C1-continuous smooth envelope (1.0 - d/d_max)^2 to avoid gradient discontinuities in SHAC
-    d_max = 0.25
+    d_max = 0.15
     dist = jnp.sqrt(dist_sq)
     smooth_envelope = jnp.maximum(1.0 - dist / d_max, 0.0) ** 2
     repulsion = active_mask * (1.0 / dist_sq) * smooth_envelope
