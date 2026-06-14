@@ -1207,13 +1207,7 @@ def train():
             
             # --- LYAPUNOV HOVER & ATTENTION GATING (DNAG) ---
             # Use real SLAM surprise (frozen for this 32-step horizon).
-            # Floor with positional distance so DNAG engages even before SLAM warms up.
-            slam_pos_t = jnp.stack([slam_x_t, slam_z_t], axis=-1)
-            dist_floor = jnp.clip(
-                jnp.sqrt(jnp.sum((slam_pos_t - target_xy)**2, axis=-1) + 1e-8) * 2.0,
-                0.0, 1.0
-            )
-            sim_surprise = jnp.maximum(frozen_surp, dist_floor)
+            sim_surprise = frozen_surp
 
             # Hover modulations: dedicated hover specialist (trained ICNN + BiologicalKinematicMap).
             # hover_fixed_params is closed over and treated as a constant by JAX JIT —
@@ -1769,11 +1763,7 @@ def vis_step_fn(env, curr_state, curr_params, step_idx, slam_surprise, hover_par
     )
     
     # --- LYAPUNOV HOVER & ATTENTION GATING (DNAG) ---
-    dist_floor = jnp.clip(
-        jnp.sqrt(jnp.sum((r_st[:, :2] - target_xy)**2, axis=-1) + 1e-8) * 2.0,
-        0.0, 1.0
-    )
-    sim_surprise = jnp.maximum(slam_surprise, dist_floor)
+    sim_surprise = slam_surprise
     
     if hover_params_single is not None:
         hover_mods, _, _ = hover_ac_model.apply(
