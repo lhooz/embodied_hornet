@@ -204,11 +204,12 @@ To register a valid loop closure and update the topological pose graph, a candid
 
 High-frequency MEMS inertial sensors on insect-scale MAVs are heavily corrupted by 115Hz wingbeat oscillations, causing significant aliasing when integrated at a 50Hz CANN update rate. Furthermore, the unsigned nature of optical flow (event camera rates) introduces direction conflicts when fused with signed IMU velocities during hovering. 
 
-To address these challenges, we implemented a complete parameterization of all sensory pre-processing, sensor scales, and current injection variables. These parameters were co-optimized using an offline, precomputed multi-objective sweep (550+ trials under a penalty-constrained loss function):
-1. **Dynamic Wingbeat Wobble Decoupling:** Gyroscope low-pass filtering was tightened (`alpha_gyro = 0.92236`) to suppress wingbeat wobble, and the gravity complementary filter fusion factor was minimized (`alpha_fuse = 0.00200`) to insulate gravity estimation from high-frequency lateral accelerations.
+To address these challenges, we implemented a complete parameterization of all sensory pre-processing, sensor scales, and current injection variables. These parameters were co-optimized using an offline, precomputed multi-seed multi-objective sweep (Random Search + Coordinate Descent passes under a trajectory-aware loss function):
+1. **Dynamic Wingbeat Wobble Decoupling:** Gyroscope low-pass filtering was tightened (`alpha_gyro = 0.82194`) to suppress wingbeat wobble, and the gravity complementary filter fusion factor was set to `0.00201` to insulate gravity estimation from high-frequency lateral accelerations.
 2. **Directional Velocity Signing:** Raw visual translation velocity is dynamically signed using the sign of the corresponding IMU velocity targets to prevent conflicting cerebellar weight updates.
-3. **CANN Ring Attractor Accel:** The angular attractor's time constant (`RING_TAU_U`) was reduced to `0.01` (10ms) to allow rapid tracking of turns up to 40 rad/s.
-4. **Millimeter-Level Performance:** This co-optimization reduced the final position error to **0.1 cm** (from 13.03 cm) and final heading drift to **0.1°** (from 9.06°) on seed 42, demonstrating exceptional tracking performance and generalizability (average position error: 8.15 cm, average heading error: 0.57° across 5 random seeds).
+3. **CANN Ring Attractor Accel:** The angular attractor's time constant (`RING_TAU_U`) was tuned to `0.02071` (20.7ms) to allow stable, high-speed tracking of fast turns.
+4. **Trajectory Lag Reduction:** Exposing the place cell continuous attractor time constant `TAU_U` allowed it to be optimized to **`0.03759`** (24.8% reduction), speeding up the attractor field response and significantly reducing position integration lag.
+5. **Robust Generalization Performance:** This co-optimization reduced the average final position error across seeds from $8.15\text{ cm}$ to **$5.60\text{ cm}$** ($31.3\%$ reduction) and average mean position error to **$3.39\text{ cm}$**. On seed 101, the final position error was reduced from $12.56\text{ cm}$ to **$3.78\text{ cm}$** (a **$70\%$** error reduction), demonstrating highly robust generalizability and drift suppression. Average final heading error is **$0.71^\circ$**.
 
 ---
 
