@@ -103,14 +103,14 @@ def policy_network_icnn(x, target_state=None, action_noise=None, SOG_v_mem=None,
         looming   = emd_signals[..., 1]
         if dynamic_gains:
             # HS-cell centering: pitch torque correction (steer away from approaching side)
-            u_forces_newtons = u_forces_newtons.at[..., 2].add(K_flow_dyn * centering)
+            u_forces_newtons = u_forces_newtons.at[..., 2].add(K_flow_dyn * centering * ScaleConfig.CONTROL_SCALE[2])
             # LGMD looming escape: forward deceleration (brake when total expansion is high)
-            u_forces_newtons = u_forces_newtons.at[..., 0].add(-K_loom_dyn * looming)
+            u_forces_newtons = u_forces_newtons.at[..., 0].add(-K_loom_dyn * looming * ScaleConfig.CONTROL_SCALE[0])
         else:
             # HS-cell centering: pitch torque correction (steer away from approaching side)
-            u_forces_newtons = u_forces_newtons.at[..., 2].add(K_flow * centering)
+            u_forces_newtons = u_forces_newtons.at[..., 2].add(K_flow * centering * ScaleConfig.CONTROL_SCALE[2])
             # LGMD looming escape: forward deceleration (brake when total expansion is high)
-            u_forces_newtons = u_forces_newtons.at[..., 0].add(-K_loom * looming)
+            u_forces_newtons = u_forces_newtons.at[..., 0].add(-K_loom * looming * ScaleConfig.CONTROL_SCALE[0])
 
     # 3. Inject SOG repulsive forces (Ventral pathway)
     if SOG_v_mem is not None:

@@ -754,32 +754,24 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
 
     ax_telemetry_right = ax_telemetry.twinx()
     ax_telemetry_right.set_facecolor('none')
-    ax_telemetry_right.tick_params(colors='#ff33ff', labelsize=8)
+    ax_telemetry_right.tick_params(colors='#cccccc', labelsize=8)
     for spine in ax_telemetry_right.spines.values():
         spine.set_edgecolor('#444444')
         
-    line_repel, = ax_telemetry_right.plot(time_series, sim_data['f_repel'], '-', color='#ff33ff', linewidth=1.2, label='SOG Repulsion')
-    max_repel = max(sim_data['f_repel']) if sim_data['f_repel'] else 1.0
-    if max_repel <= 0.0: max_repel = 1.0
-    ax_telemetry_right.set_ylim(-0.05 * max_repel, max_repel * 1.1)
-    ax_telemetry_right.set_ylabel('SOG Repel (N)', color='#ff33ff', fontsize=8)
-
-    ax_telemetry_right2 = ax_telemetry.twinx()
-    ax_telemetry_right2.spines['right'].set_position(('outward', 45))
-    ax_telemetry_right2.set_facecolor('none')
-    ax_telemetry_right2.tick_params(colors='#39ff14', labelsize=8)
-    for spine_name, spine in ax_telemetry_right2.spines.items():
-        if spine_name == 'right':
-            spine.set_visible(True)
-            spine.set_edgecolor('#444444')
-        else:
-            spine.set_visible(False)
-            
-    line_emd, = ax_telemetry_right2.plot(time_series, sim_data['flow_corr'], '-', color='#39ff14', linewidth=1.2, label='EMD Centering')
-    max_emd = max(abs(x) for x in sim_data['flow_corr']) if sim_data['flow_corr'] else 1.0
-    if max_emd <= 0.0: max_emd = 1.0
-    ax_telemetry_right2.set_ylim(-max_emd * 1.1, max_emd * 1.1)
-    ax_telemetry_right2.set_ylabel('EMD Centering', color='#39ff14', fontsize=8)
+    # Plot SOG Repulsion in normalized units (divided by force control scale 0.05 N)
+    sog_ratio = np.array(sim_data['f_repel']) / 0.05
+    line_repel, = ax_telemetry_right.plot(time_series, sog_ratio, '-', color='#ff33ff', linewidth=1.2, label='SOG Repulsion')
+    
+    # Plot EMD Centering in normalized units (flow_corr is already a CPG torque input ratio)
+    line_emd, = ax_telemetry_right.plot(time_series, sim_data['flow_corr'], '-', color='#39ff14', linewidth=1.2, label='EMD Centering')
+    
+    max_repel_ratio = max(sog_ratio) if len(sog_ratio) > 0 else 1.0
+    max_emd_ratio = max(abs(x) for x in sim_data['flow_corr']) if sim_data['flow_corr'] else 1.0
+    max_val = max(max_repel_ratio, max_emd_ratio)
+    if max_val <= 0.0: max_val = 1.0
+    
+    ax_telemetry_right.set_ylim(-max_val * 1.1, max_val * 1.1)
+    ax_telemetry_right.set_ylabel('Reflex Action (Ratio of Max)', color='#cccccc', fontsize=8)
 
     lines = [line_surprise, line_alpha, line_repel, line_emd]
     labels = [l.get_label() for l in lines]

@@ -64,8 +64,8 @@ def compute_emd_intensities(robot_pos, robot_heading, segments):
     min_dists = jnp.min(dists, axis=-1)  # (N_EMD_PIX,) closest hit per pixel
     
     # Distance-based intensity: bright when close, dim when far
-    # Clipped to prevent infinity at d=0
-    intensities = 1.0 / (min_dists + 0.01)
+    # Bounded to [0, 1] using a characteristic safety scale of 0.1m (10cm)
+    intensities = 0.1 / (min_dists + 0.1)
     
     return intensities, min_dists
 
