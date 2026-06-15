@@ -627,6 +627,7 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
     heading_arr = ax_nav.quiver([0], [0], [0], [0], color='#ff8888', scale=1.0, scale_units='xy', width=0.006, headwidth=4, headlength=5, zorder=16, label='Sensor Heading')
     slam_heading_arr = ax_nav.quiver([0], [0], [0], [0], color='#ffa500', scale=1.0, scale_units='xy', width=0.006, headwidth=4, headlength=5, zorder=15, label='SLAM Heading')
     vel_arr = ax_nav.quiver([0], [0], [0], [0], color='#ff33ff', scale=1.0, scale_units='xy', width=0.006, headwidth=4, headlength=5, zorder=16, label='Velocity')
+    target_dir_arr = ax_nav.quiver([0], [0], [0], [0], color='#ffcc00', scale=1.0, scale_units='xy', width=0.006, headwidth=4, headlength=5, zorder=17, label='Believed Target Dir')
 
     # 3 ToF beam artists
     _beam_colours = ['#00aaff', '#ffff44', '#00aaff']
@@ -672,6 +673,7 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
     )
     map_robot_dot, = ax_map.plot([], [], 'o', color='#00ffcc', markersize=5, zorder=10, label='Robot')
     map_trail_line, = ax_map.plot([], [], '-', color='#00ffcc', linewidth=0.8, alpha=0.4, zorder=5, label='Trail')
+    map_target_dir_arr = ax_map.quiver([0], [0], [0], [0], color='#ffcc00', scale=1.0, scale_units='xy', width=0.006, headwidth=4, headlength=5, zorder=16, label='Believed Target Dir')
 
     map_tof_beam_artists = []
     for _bc in _beam_colours:
@@ -783,6 +785,8 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
         if frame >= len(sim_data['states']): return
 
         r_state  = sim_data['states'][frame]
+        ux_believed = 0.0
+        uy_believed = 0.0
         w_pose   = sim_data['wing_pose'][frame]
         f_nodal  = sim_data['nodal_forces'][frame]
         le_pos   = sim_data['le_marker'][frame]
@@ -799,6 +803,7 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
             ys = [p[1] for p in slam_pos]
             traj_line.set_data(xs, ys)
             hornet_dot.set_data([xs[-1]], [ys[-1]])
+            cu, cv = xs[-1], ys[-1]
             
             # SLAM estimated path, pose dot, and heading arrow (world belief)
             if frame < len(sim_data['slam_est']):
@@ -810,6 +815,18 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
                 slam_est_dot.set_data([est_xs[-1]], [est_ys[-1]])
                 slam_heading_arr.set_offsets([[est_xs[-1], est_ys[-1]]])
                 slam_heading_arr.set_UVC([0.2 * np.cos(est_th)], [0.2 * np.sin(est_th)])
+                
+                # Believed target direction vector (from believed position to target)
+                est_u, est_v = est_xs[-1], est_ys[-1]
+                dx_believed = tgt_u - est_u
+                dy_believed = tgt_v - est_v
+                dist_believed = np.sqrt(dx_believed**2 + dy_believed**2) + 1e-8
+                ux_believed = dx_believed / dist_believed
+                uy_believed = dy_believed / dist_believed
+                
+                # Update believed target direction arrow in physical space (ax_nav) starting at physical body (cu, cv)
+                target_dir_arr.set_offsets([[cu, cv]])
+                target_dir_arr.set_UVC([0.2 * ux_believed], [0.2 * uy_believed])
                 
             # Raw IMU dead-reckoning path and pose dot
             if frame < len(sim_data['imu_dr']):
@@ -846,6 +863,10 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
 
                     # Update robot dot and trail on the map
                     map_robot_dot.set_data([est_u], [est_v])
+                    
+                    # Update believed target direction arrow on SOG map starting at believed body (est_u, est_v)
+                    map_target_dir_arr.set_offsets([[est_u, est_v]])
+                    map_target_dir_arr.set_UVC([0.2 * ux_believed], [0.2 * uy_believed])
                     trail_pts = sim_data['slam_est'][:frame+1]
                     map_trail_line.set_data(
                         [p[0] for p in trail_pts],
@@ -952,7 +973,7 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
 
         return (patch_thorax, patch_le, patch_hinge, traj_line, hornet_dot, slam_est_line,
                 slam_est_dot, imu_dr_line, imu_dr_dot, heading_arr, slam_heading_arr,
-                snn_time_line, telemetry_time_line)
+                target_dir_arr, map_target_dir_arr, snn_time_line, telemetry_time_line)
 
     plt.tight_layout()
     if len(sim_data['states']) == 0:
