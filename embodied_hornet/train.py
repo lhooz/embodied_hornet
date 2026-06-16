@@ -108,7 +108,7 @@ class Config:
     RESET_INTERVAL = 200     
     PBT_INTERVAL = 500      
 
-    BATCH_SIZE = 32          
+    BATCH_SIZE = 12          
     LR_ACTOR = 5e-4
     LR_WARMUP_STEPS = 50        # ramp LR from LR_ACTOR/50 → LR_ACTOR over this many steps
     MAX_GRAD_NORM = 1.0
@@ -288,11 +288,10 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
     if slam_system is not None:
         vis_slam = copy.deepcopy(slam_system)
         if best_idx != 0:
-            # We must reset and initialize the pose tracker to match the best agent's spawn position
-            r_state_np_start = np.array(state[0][0])
-            start_slam_x = float(r_state_np_start[0]) * env._slam_scale + 1.0
-            start_slam_z = float(r_state_np_start[1]) * env._slam_scale + 1.0
-            start_slam_th = float(r_state_np_start[2]) - 1.0  # sensor heading
+            # We must reset and initialize the pose tracker to match the best agent's training SLAM pose
+            start_slam_x = float(slam_pose[best_idx, 0])
+            start_slam_z = float(slam_pose[best_idx, 1])
+            start_slam_th = float(slam_pose[best_idx, 2])
             
             vis_slam.reset_pose_only(1)
             vis_slam.initialize_pose(
@@ -304,9 +303,9 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
             last_slam_est_th = start_slam_th
             print(f"    -> Deepcopied SLAM system but reset & re-initialized pose to best agent ({best_idx}) start: ({last_slam_est_u:.2f}, {last_slam_est_v:.2f})")
         else:
-            last_slam_est_u = float(slam_pose[0])
-            last_slam_est_v = float(slam_pose[1])
-            last_slam_est_th = float(slam_pose[2])
+            last_slam_est_u = float(slam_pose[0, 0])
+            last_slam_est_v = float(slam_pose[0, 1])
+            last_slam_est_th = float(slam_pose[0, 2])
             print(f"    -> Deepcopied SLAM system from training run at pose ({last_slam_est_u:.2f}, {last_slam_est_v:.2f})")
     else:
         from snn_slam_system import SNNSLAMSystem
@@ -449,9 +448,12 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
         dr_vz = float(r_state_np[5]) * env._slam_scale
         dr_vth = float(r_state_np[6]) # angular velocity (yaw rate)
         
-        # Integrate raw IMU dead-reckoning (without feedback correction)
-        raw_imu_x += dr_vx * physics_dt
-        raw_imu_z += dr_vz * physics_dt
+        # Integrate raw IMU dead-reckoning (velocities from state vector are already global frame)
+        dr_vx_glob = dr_vx
+        dr_vz_glob = dr_vz
+        
+        raw_imu_x += dr_vx_glob * physics_dt
+        raw_imu_z += dr_vz_glob * physics_dt
         raw_imu_th += dr_vth * physics_dt
         raw_imu_th = (raw_imu_th + np.pi) % (2 * np.pi) - np.pi
         sim_data['imu_dr'].append((raw_imu_x, raw_imu_z, raw_imu_th))
@@ -463,8 +465,11 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
         err_th = last_slam_est_th - dr_th
         err_th = (err_th + np.pi) % (2 * np.pi) - np.pi
         
-        dr_x += (dr_vx + K_CORR * err_x) * physics_dt
-        dr_z += (dr_vz + K_CORR * err_z) * physics_dt
+        dr_vx_glob_corr = dr_vx
+        dr_vz_glob_corr = dr_vz
+        
+        dr_x += (dr_vx_glob_corr + K_CORR * err_x) * physics_dt
+        dr_z += (dr_vz_glob_corr + K_CORR * err_z) * physics_dt
         dr_th += (dr_vth + K_CORR * err_th) * physics_dt
         dr_th = (dr_th + np.pi) % (2 * np.pi) - np.pi
         
@@ -1077,10 +1082,10 @@ def train():
             _copied = []
             for k in _hover_full:
                 if k not in _value_head_keys and k in params:
-                    params[k] = _hover_full[k]  # (32,...) — full diverse PBT population
+                    params[k] = jax.tree.map(lambda x: x[:Config.BATCH_SIZE], _hover_full[k])  # slice PyTree leaves
                     _copied.append(k)
             print(f"--> [WARM-START] Copied {len(_copied)} param groups from hover_params.pkl "
-                  f"(full 32-agent PBT diversity): {_copied}")
+                  f"(population size {Config.BATCH_SIZE}): {_copied}")
         else:
             print("--> [WARM-START] hover_params.pkl not found — keeping random init (expect NaN at step 0)")
 
@@ -1108,7 +1113,7 @@ def train():
     if os.path.exists(_hover_pkl):
         with open(_hover_pkl, "rb") as _f:
             _hover_ckpt = pickle.load(_f)
-        hover_fixed_params = jax.tree.map(jnp.array, _hover_ckpt['params'])
+        hover_fixed_params = jax.tree.map(lambda x: jnp.array(x[:Config.BATCH_SIZE]), _hover_ckpt['params'])
         _hover_batch = jax.tree.leaves(hover_fixed_params)[0].shape[0]
         _use_hover_specialist = True
         print(f"--> [HOVER] Loaded hover specialist from hover_params.pkl "
@@ -1161,10 +1166,9 @@ def train():
         initial_emd_intensities = jnp.zeros((B, Config.N_EMD_PIX))
         
         # Convert SLAM pose from physical 2m space → hornet physical metres for Instar routing
-        # slam_pose[:2] = (x, y) in physical SLAM (= hornet + 1.0); slam_pose[2] = heading
-        slam_xy_hornet = (slam_pose[:2] - _SLAM_OFFSET_TRAIN) / env._slam_scale
-        slam_pose_hornet = jnp.concatenate([slam_xy_hornet, slam_pose[2:3]])  # (3,)
-        frozen_pose  = jnp.broadcast_to(slam_pose_hornet, (B, 3))    # same pose for all agents
+        # slam_pose[:, :2] = (x, y) in physical SLAM (= hornet + 1.0); slam_pose[:, 2] = heading
+        slam_xy_hornet = (slam_pose[:, :2] - _SLAM_OFFSET_TRAIN) / env._slam_scale
+        slam_pose_hornet = jnp.concatenate([slam_xy_hornet, slam_pose[:, 2:3]], axis=-1)  # (B, 3)
         frozen_surp  = jnp.full((B,), slam_surprise)                  # same surprise for all agents
         
         scan_inputs = (rollout_indices, phys_indices, scan_keys)
@@ -1182,9 +1186,9 @@ def train():
             disp_z = curr_robot[:, 1] - start_robot[:, 1]
             disp_th = curr_robot[:, 2] - start_robot[:, 2]
             
-            slam_x_t = slam_xy_hornet[0] + disp_x
-            slam_z_t = slam_xy_hornet[1] + disp_z
-            slam_th_t = slam_pose_hornet[2] + disp_th
+            slam_x_t = slam_pose_hornet[:, 0] + disp_x
+            slam_z_t = slam_pose_hornet[:, 1] + disp_z
+            slam_th_t = slam_pose_hornet[:, 2] + disp_th
             
             # Construct the SLAM-based observation robot state relative to the target
             obs_robot = curr_robot
@@ -1449,26 +1453,26 @@ def train():
     slam_system = SNNSLAMSystem(jax.random.PRNGKey(7), n_depth=N_DEPTH)
     slam_system.reset(1)
 
-    # Bootstrap SLAM from agent-0's initial pose (centre of 10m room)
-    init_robot0  = np.array(curr_state[0][0])            # (8,) hornet state
-    init_slam_x  = float(init_robot0[0]) * env._slam_scale + 1.0
-    init_slam_z  = float(init_robot0[1]) * env._slam_scale + 1.0
-    init_slam_th = float(init_robot0[2]) - 1.0  # sensor heading (facing forward)
+    # Bootstrap SLAM from initial poses of all agents
+    init_robot   = np.array(curr_state[0])               # (B, 8) hornet states
+    init_slam_x  = init_robot[:, 0] * env._slam_scale + 1.0
+    init_slam_z  = init_robot[:, 1] * env._slam_scale + 1.0
+    init_slam_th = init_robot[:, 2] - 1.0  # sensor heading
     slam_system.initialize_pose(
-        jnp.array([[init_slam_x, init_slam_z]]),
-        jnp.array([init_slam_th]),
+        jnp.array([[init_slam_x[0], init_slam_z[0]]]),
+        jnp.array([init_slam_th[0]]),
     )
 
-    # SLAM state carried between outer loop iterations
-    slam_pose     = jnp.array([init_slam_x, init_slam_z, init_slam_th])  # (3,)
+    # SLAM state carried between outer loop iterations (B, 3)
+    slam_pose     = jnp.stack([jnp.array(init_slam_x), jnp.array(init_slam_z), jnp.array(init_slam_th)], axis=1)  # (B, 3)
     slam_surprise = 0.0                                                    # float
     slam_prev_int = np.zeros(N_PIXELS, dtype=np.float32)                  # event delta baseline
     slam_vis_csnn = jnp.zeros(256)
     slam_vis_stdp = jnp.zeros(256)
-    print(f"    -> SLAM initialised at ({init_slam_x:.2f}, {init_slam_z:.2f}) m, sensor heading {init_slam_th:.2f} rad")
+    print(f"    -> SLAM initialised at Agent 0 ({init_slam_x[0]:.2f}, {init_slam_z[0]:.2f}) m, sensor heading {init_slam_th[0]:.2f} rad")
     
     # Helper: regenerate arena + reset SLAM at episode boundaries
-    def _reset_slam_for_new_arena(key, curr_agent0_state):
+    def _reset_slam_for_new_arena(key, curr_agent_states):
         """
         Called at forced-reset boundaries (PBT + periodic RESET_INTERVAL).
         1. Regenerates obstacle room (new episode = new room).
@@ -1481,51 +1485,25 @@ def train():
             env.regenerate_arena(key=key)
         env._prev_robot_state = None
 
-        # Re-initialise SLAM from agent-0's current pose in the new room
-        r0 = np.array(curr_agent0_state)
-        new_slam_x  = float(r0[0]) * env._slam_scale + 1.0
-        new_slam_z  = float(r0[1]) * env._slam_scale + 1.0
-        new_slam_th = float(r0[2]) - 1.0  # sensor heading (facing forward)
+        # Re-initialise SLAM from all agents' current poses in the new room
+        r = np.array(curr_agent_states)
+        new_slam_x  = r[:, 0] * env._slam_scale + 1.0
+        new_slam_z  = r[:, 1] * env._slam_scale + 1.0
+        new_slam_th = r[:, 2] - 1.0
 
         slam_system.reset(1)
         slam_system.initialize_pose(
-            jnp.array([[new_slam_x, new_slam_z]]),
-            jnp.array([new_slam_th]),
+            jnp.array([[new_slam_x[0], new_slam_z[0]]]),
+            jnp.array([new_slam_th[0]]),
         )
         slam_prev_int = np.zeros(N_PIXELS, dtype=np.float32)  # clear event baseline
         slam_vis_csnn = jnp.zeros(256)
         slam_vis_stdp = jnp.zeros(256)
         sog_state = sog_system.init_state()
 
-        new_slam_pose = jnp.array([new_slam_x, new_slam_z, new_slam_th])
-        print(f"    ---> New arena + SLAM reset: pose ({new_slam_x:.2f}, {new_slam_z:.2f}) m, sensor heading {new_slam_th:.2f} rad")
+        new_slam_pose = jnp.stack([jnp.array(new_slam_x), jnp.array(new_slam_z), jnp.array(new_slam_th)], axis=1)
+        print(f"    ---> New arena + SLAM reset: Agent 0 pose ({new_slam_x[0]:.2f}, {new_slam_z[0]:.2f}) m, heading {new_slam_th[0]:.2f} rad")
         return new_slam_pose, 0.0  # fresh room → surprise starts at 0
-
-    def _reinit_slam_on_crash(curr_agent0_state):
-        """
-        Called when agent-0 crashes and resets individually.
-        Resets and re-initialises the SLAM tracker to match the fresh spawn position,
-        without regenerating the obstacle distribution of the arena.
-        """
-        nonlocal slam_prev_int, slam_vis_csnn, slam_vis_stdp
-        env._prev_robot_state = None
-        r0 = np.array(curr_agent0_state)
-        new_slam_x  = float(r0[0]) * env._slam_scale + 1.0
-        new_slam_z  = float(r0[1]) * env._slam_scale + 1.0
-        new_slam_th = float(r0[2]) - 1.0
-
-        slam_system.reset_pose_only(1)
-        slam_system.initialize_pose(
-            jnp.array([[new_slam_x, new_slam_z]]),
-            jnp.array([new_slam_th]),
-        )
-        slam_prev_int = np.zeros(N_PIXELS, dtype=np.float32)
-        slam_vis_csnn = jnp.zeros(256)
-        slam_vis_stdp = jnp.zeros(256)
-
-        new_slam_pose = jnp.array([new_slam_x, new_slam_z, new_slam_th])
-        print(f"    [SLAM RESET ON CRASH] Re-initialized at ({new_slam_x:.2f}, {new_slam_z:.2f}) m")
-        return new_slam_pose, 0.0
 
     # --- JIT Compilation ---
     print("-----> Compiling JAX Update...")
@@ -1574,17 +1552,46 @@ def train():
                     inject_drift=False, autopilot_on=(slam_surprise < 0.60),
                     dt=dt_per_cann_step
                 )
-            slam_pose     = jnp.array([
-                float(pose_est[0, 0]),   # x in 2m space
-                float(pose_est[0, 1]),   # y in 2m space
-                float(pose_est[0, 2]),   # heading
-            ])
+            # Virtual Displacement Tracking: integrate relative odometry for all agents
+            slam_pose_np = np.array(slam_pose)
+            curr_pos = np.array(curr_state[0])
+            next_pos = np.array(next_state[0])
+            disp_x = (next_pos[:, 0] - curr_pos[:, 0]) * env._slam_scale
+            disp_z = (next_pos[:, 1] - curr_pos[:, 1]) * env._slam_scale
+            disp_th = next_pos[:, 2] - curr_pos[:, 2]
+            
+            slam_pose_np[:, 0] += disp_x
+            slam_pose_np[:, 1] += disp_z
+            slam_pose_np[:, 2] += disp_th
+            slam_pose_np[:, 2] = np.mod(slam_pose_np[:, 2] + np.pi, 2 * np.pi) - np.pi
+            
+            # Overwrite Agent 0 with the true CPU CANN SLAM estimate
+            slam_pose_np[0, 0] = float(pose_est[0, 0])
+            slam_pose_np[0, 1] = float(pose_est[0, 1])
+            slam_pose_np[0, 2] = float(pose_est[0, 2])
+            
+            slam_pose = jnp.array(slam_pose_np)
             slam_surprise = float(1.0 - float(debug_gates['Raw_Match'][0]))
             slam_vis_csnn = jnp.array(debug_gates['Debug_Input_CSNN'][0])
             slam_vis_stdp = jnp.array(debug_gates['Debug_Input_STDP'][0])
         except Exception as _slam_err:
-            # Graceful fallback: keep previous SLAM values
             print(f"    [SLAM] non-fatal error at step {i}: {_slam_err}")
+            # Even if CPU SLAM fails, we still integrate displacements for all agents
+            try:
+                slam_pose_np = np.array(slam_pose)
+                curr_pos = np.array(curr_state[0])
+                next_pos = np.array(next_state[0])
+                disp_x = (next_pos[:, 0] - curr_pos[:, 0]) * env._slam_scale
+                disp_z = (next_pos[:, 1] - curr_pos[:, 1]) * env._slam_scale
+                disp_th = next_pos[:, 2] - curr_pos[:, 2]
+                
+                slam_pose_np[:, 0] += disp_x
+                slam_pose_np[:, 1] += disp_z
+                slam_pose_np[:, 2] += disp_th
+                slam_pose_np[:, 2] = np.mod(slam_pose_np[:, 2] + np.pi, 2 * np.pi) - np.pi
+                slam_pose = jnp.array(slam_pose_np)
+            except Exception as _fallback_err:
+                print(f"    [SLAM FALLBACK] error: {_fallback_err}")
             
         # Update SOG for training agent-0 (outside JIT)
         try:
@@ -1607,7 +1614,24 @@ def train():
             opt_state = _prev_opt_state  # restore last-known-good optimizer state
             rng, k_res = jax.random.split(rng)
             curr_state = env.reset(k_res, Config.BATCH_SIZE)
-            slam_pose, slam_surprise = _reinit_slam_on_crash(curr_state[0][0])
+            
+            # Reset all SLAM poses and the CPU SLAM tracker
+            r = np.array(curr_state[0])
+            new_xs = r[:, 0] * env._slam_scale + 1.0
+            new_zs = r[:, 1] * env._slam_scale + 1.0
+            new_ths = r[:, 2] - 1.0
+            slam_pose = jnp.stack([jnp.array(new_xs), jnp.array(new_zs), jnp.array(new_ths)], axis=1)
+            
+            env._prev_robot_state = None
+            slam_system.reset_pose_only(1)
+            slam_system.initialize_pose(
+                jnp.array([[new_xs[0], new_zs[0]]]),
+                jnp.array([new_ths[0]]),
+            )
+            slam_prev_int = np.zeros(N_PIXELS, dtype=np.float32)
+            slam_vis_csnn = jnp.zeros(256)
+            slam_vis_stdp = jnp.zeros(256)
+            slam_surprise = 0.0
             continue
         
         r_state = next_state[0]
@@ -1643,10 +1667,33 @@ def train():
         fresh_target_xy = jax.random.uniform(k_fresh_tgt, (Config.BATCH_SIZE, 2), minval=-0.8, maxval=0.8)
         target_xy = jnp.where(reset_mask[:, None], fresh_target_xy, target_xy)
 
-        # 🌟 CRITICAL FIX: If agent 0 (tracked by SLAM) crashed and reset,
-        # we must reset the SLAM tracker to match its new spawn position!
-        if reset_mask[0]:
-            slam_pose, slam_surprise = _reinit_slam_on_crash(curr_state[0][0])
+        # If any agent resets, we must update its SLAM pose to match its new spawn position
+        if reset_mask.any():
+            r = np.array(curr_state[0])
+            new_xs = r[:, 0] * env._slam_scale + 1.0
+            new_zs = r[:, 1] * env._slam_scale + 1.0
+            new_ths = r[:, 2] - 1.0
+            
+            slam_pose_np = np.array(slam_pose)
+            reset_mask_np = np.array(reset_mask)
+            slam_pose_np[reset_mask_np, 0] = new_xs[reset_mask_np]
+            slam_pose_np[reset_mask_np, 1] = new_zs[reset_mask_np]
+            slam_pose_np[reset_mask_np, 2] = new_ths[reset_mask_np]
+            slam_pose = jnp.array(slam_pose_np)
+            
+            # If Agent 0 crashed, we also re-initialize the CPU CANN SLAM tracker
+            if reset_mask_np[0]:
+                env._prev_robot_state = None
+                slam_system.reset_pose_only(1)
+                slam_system.initialize_pose(
+                    jnp.array([[new_xs[0], new_zs[0]]]),
+                    jnp.array([new_ths[0]]),
+                )
+                slam_prev_int = np.zeros(N_PIXELS, dtype=np.float32)
+                slam_vis_csnn = jnp.zeros(256)
+                slam_vis_stdp = jnp.zeros(256)
+                slam_surprise = 0.0
+                print(f"    [SLAM RESET ON CRASH] Re-initialized Agent 0 at ({new_xs[0]:.2f}, {new_zs[0]:.2f}) m")
 
         # 3. Telemetry & Logging
         dt_epoch = time.time() - t0              
@@ -1708,7 +1755,7 @@ def train():
             env.regenerate_arena(key=k_arena)
             curr_state = env.reset(rng, Config.BATCH_SIZE)
             slam_pose, slam_surprise = _reset_slam_for_new_arena(
-                None, curr_state[0][0]  # agent-0's new spawn state
+                None, curr_state[0]  # all agents' new spawn states
             )
             rng, k_tgt = jax.random.split(rng)
             target_xy = jax.random.uniform(k_tgt, (Config.BATCH_SIZE, 2), minval=-0.8, maxval=0.8)

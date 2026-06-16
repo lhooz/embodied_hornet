@@ -553,8 +553,10 @@ class FlyEnv:
 
         # Convert global velocities [vx_glob, vz_glob] to forward/lateral in the sensor-frame
         # to match the CANN and cerebellum's expected coordinate system.
-        cos_sh = np.cos(sensor_heading)
-        sin_sh = np.sin(sensor_heading)
+        # Use midpoint heading over the step to align with 2nd-order SLAM midpoint integration
+        sensor_heading_mid = sensor_heading - (w_theta * dt) / 2.0
+        cos_sh = np.cos(sensor_heading_mid)
+        sin_sh = np.sin(sensor_heading_mid)
         
         vx_sensor = (vx_glob * cos_sh + vz_glob * sin_sh) * self._slam_scale
         vz_sensor = (-vx_glob * sin_sh + vz_glob * cos_sh) * self._slam_scale
@@ -564,7 +566,7 @@ class FlyEnv:
         ax_proper = ax_glob
         az_proper = az_glob + 9.81
         
-        # Rotate proper acceleration into body-fixed sensor frame
+        # Rotate proper acceleration into body-fixed sensor frame using midpoint heading
         acc_x = ax_proper * cos_sh + az_proper * sin_sh
         acc_z = -ax_proper * sin_sh + az_proper * cos_sh
         
