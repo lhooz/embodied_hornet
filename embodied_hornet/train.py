@@ -108,7 +108,7 @@ class Config:
     RESET_INTERVAL = 200     
     PBT_INTERVAL = 500      
 
-    BATCH_SIZE = 12          
+    BATCH_SIZE = 6          
     LR_ACTOR = 5e-4
     LR_WARMUP_STEPS = 50        # ramp LR from LR_ACTOR/50 → LR_ACTOR over this many steps
     MAX_GRAD_NORM = 1.0
