@@ -125,9 +125,9 @@ class Config:
     CURRICULUM_RATIO = 0.5
     
     # --- Obstacle Avoidance Gains ---
-    K_REPEL = 0.005
-    K_FLOW = 0.3         # HS centering reflex gain (Dorsal stream — pitch torque)
-    K_LOOM = 0.1         # LGMD looming escape gain (Dorsal stream — forward deceleration)
+    K_REPEL = 0.05
+    K_FLOW = 1.0         # HS centering reflex gain (Dorsal stream — pitch torque)
+    K_LOOM = 0.8         # LGMD looming escape gain (Dorsal stream — forward deceleration)
     N_EMD_PIX = 32       # Coarse ommatidial array resolution (Dorsal stream)
     EMD_TAU_BASE = 0.05       # Base EMD delay time constant (seconds) at 0 speed
     EMD_TAU_SPEED_GAIN = 2.0  # Gain for speed-adaptive EMD delay reduction
@@ -1974,7 +1974,14 @@ def vis_step_fn(env, curr_state, curr_params, step_idx, slam_surprise, hover_par
     f_net_slam = jnp.stack([f_net_slam_x, f_net_slam_y])
     
     # EMD contribution in body frame (net force - no emd force)
-    f_emd_body = blended_forces_eff - blended_forces_no_emd_eff
+    # Since centering reflex is a steering torque (index 2), we project it to a virtual lateral force (index 1)
+    # so that the steering reflex is visually represented on the 2D map.
+    f_emd_body_x = blended_forces_eff[0] - blended_forces_no_emd_eff[0]
+    torque_diff_ratio = (blended_forces[0, 2] - blended_forces_no_emd[0, 2]) / ScaleConfig.CONTROL_SCALE[2]
+    f_emd_steer_virtual = torque_diff_ratio * ScaleConfig.CONTROL_SCALE[1]
+    f_emd_body_y = (blended_forces_eff[1] - blended_forces_no_emd_eff[1]) + f_emd_steer_virtual
+    f_emd_body = jnp.stack([f_emd_body_x, f_emd_body_y])
+    
     f_emd_slam_x = f_emd_body[0] * cos_th - f_emd_body[1] * sin_th
     f_emd_slam_y = f_emd_body[0] * sin_th + f_emd_body[1] * cos_th
     f_emd_slam = jnp.stack([f_emd_slam_x, f_emd_slam_y])

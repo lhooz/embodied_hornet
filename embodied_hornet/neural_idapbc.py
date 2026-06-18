@@ -90,10 +90,10 @@ def policy_network_icnn(x, target_state=None, action_noise=None, SOG_v_mem=None,
         raw_K = net_K(x)
         
         # Map to positive bounded ranges:
-        scale_flow = jnp.where(K_flow > 0.0, K_flow, 1.0)
-        scale_loom = jnp.where(K_loom > 0.0, K_loom, 1.0)
-        K_flow_dyn = jax.nn.sigmoid(raw_K[..., 0]) * 1.0 * scale_flow
-        K_loom_dyn = jax.nn.sigmoid(raw_K[..., 1]) * 0.5 * scale_loom
+        scale_flow = K_flow
+        scale_loom = K_loom
+        K_flow_dyn = jax.nn.sigmoid(raw_K[..., 0]) * 2.0 * scale_flow
+        K_loom_dyn = jax.nn.sigmoid(raw_K[..., 1]) * 2.0 * scale_loom
 
     # Saturate the goal-seeking brain forces first (dimensionless ratios in [-1, 1])
     u_forces_saturated = jnp.tanh(u_forces_newtons / ScaleConfig.CONTROL_SCALE)
