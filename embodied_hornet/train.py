@@ -1357,11 +1357,11 @@ def train():
             norm_stdp  = jnp.broadcast_to(vis_stdp, (B, 256))
             visual_features = (norm_csnn, norm_stdp)
             
-            # Update Instar Weights & Project weighted belief for the next control step
             # CRITICAL: Normalize u_brain from raw Newtons to [-1,1] saturated commands
-            # before feeding as the Instar Hebbian target signal.  Raw forces (e.g. 50 N)
-            # cause dW = eta*y*x ≈ 5*x per step → weight explosion → NaN in 32 steps.
-            u_brain_saturated = jnp.tanh(u_brain / Config.FORCE_NORMALIZER)
+            # before feeding as the Instar Hebbian target signal.  Use index 1 (the ICNN's
+            # raw target-seeking goal force) to avoid learning transient obstacle dodge responses.
+            u_brain_goal = u_brain[:, 1, :]
+            u_brain_saturated = jnp.tanh(u_brain_goal / Config.FORCE_NORMALIZER)
             next_full, next_weighted_belief = env.ingest_perceptual_streams(
                 next_full, pose_belief, visual_features, u_brain_saturated
             )
@@ -1406,7 +1406,8 @@ def train():
             obs_penalty   = Config.OBS_PENALTY_WEIGHT * obs_violation            # (B,)
 
             # --- SCALE Force ---
-            raw_diff = u_brain[:, :3] - f_actual[:, :3]
+            # Compare net effective forces (index 0 of axis 1) with actual aerodynamic forces
+            raw_diff = u_brain[:, 0, :3] - f_actual[:, :3]
             norm_diff = raw_diff / Config.FORCE_NORMALIZER[:3]
             force_err_norm = jnp.mean(jnp.square(symlog(norm_diff)))
             
@@ -1962,8 +1963,9 @@ def vis_step_fn(env, curr_state, curr_params, step_idx, slam_surprise, hover_par
     # To prevent raw unsaturated gradients (which can be very large) from extending outside
     # the visualization bounds, we plot the ACTUAL effective forces sent to the muscles.
     control_scale_xy = jnp.array([0.05, 0.05])
-    blended_forces_eff = jnp.tanh(blended_forces[0, :2] / control_scale_xy) * control_scale_xy
-    blended_forces_no_emd_eff = jnp.tanh(blended_forces_no_emd[0, :2] / control_scale_xy) * control_scale_xy
+    # blended_forces shape is (B, 2, 4) where index 0 is net effective forces
+    blended_forces_eff = blended_forces[0, 0, :2]
+    blended_forces_no_emd_eff = blended_forces_no_emd[0, 0, :2]
 
     theta = sensor_heading_batch[0]
     cos_th = jnp.cos(theta)
@@ -1977,7 +1979,7 @@ def vis_step_fn(env, curr_state, curr_params, step_idx, slam_surprise, hover_par
     # Since centering reflex is a steering torque (index 2), we project it to a virtual lateral force (index 1)
     # so that the steering reflex is visually represented on the 2D map.
     f_emd_body_x = blended_forces_eff[0] - blended_forces_no_emd_eff[0]
-    torque_diff_ratio = (blended_forces[0, 2] - blended_forces_no_emd[0, 2]) / ScaleConfig.CONTROL_SCALE[2]
+    torque_diff_ratio = (blended_forces[0, 0, 2] - blended_forces_no_emd[0, 0, 2]) / ScaleConfig.CONTROL_SCALE[2]
     f_emd_steer_virtual = torque_diff_ratio * ScaleConfig.CONTROL_SCALE[1]
     f_emd_body_y = (blended_forces_eff[1] - blended_forces_no_emd_eff[1]) + f_emd_steer_virtual
     f_emd_body = jnp.stack([f_emd_body_x, f_emd_body_y])
@@ -1986,13 +1988,11 @@ def vis_step_fn(env, curr_state, curr_params, step_idx, slam_surprise, hover_par
     f_emd_slam_y = f_emd_body[0] * sin_th + f_emd_body[1] * cos_th
     f_emd_slam = jnp.stack([f_emd_slam_x, f_emd_slam_y])
     
-    # Rotate net force without EMD to global SLAM space
-    f_net_no_emd_x = blended_forces_no_emd_eff[0] * cos_th - blended_forces_no_emd_eff[1] * sin_th
-    f_net_no_emd_y = blended_forces_no_emd_eff[0] * sin_th + blended_forces_no_emd_eff[1] * cos_th
-    f_net_no_emd_slam = jnp.stack([f_net_no_emd_x, f_net_no_emd_y])
-    
-    # Brain goal-seeking force in SLAM space (net force without EMD minus SOG force)
-    f_brain_slam = f_net_no_emd_slam - f_repel_scaled[0]
+    # Rotate true brain goal-seeking force (index 1) to global SLAM space
+    f_brain_body = blended_forces[0, 1, :2]
+    f_brain_slam_x = f_brain_body[0] * cos_th - f_brain_body[1] * sin_th
+    f_brain_slam_y = f_brain_body[0] * sin_th + f_brain_body[1] * cos_th
+    f_brain_slam = jnp.stack([f_brain_slam_x, f_brain_slam_y])
 
     # Compute EMD-derived centering signal for telemetry
     centering_signal = emd_signals[:, 0]

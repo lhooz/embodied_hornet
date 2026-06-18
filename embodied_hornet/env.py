@@ -433,7 +433,13 @@ class FlyEnv:
         loss_ang_abdomen = err[:, 3]**2
         loss_lin_vel = jnp.sum(err[:, 4:6]**2, axis=1)
         loss_ang_vel = jnp.sum(err[:, 6:8]**2, axis=1)
-        loss_eff = jnp.sum(u_forces**2, axis=1)
+        # Penalize the raw ICNN goal force (index 1 of axis -2) instead of net force
+        # to prevent the brain from learning to counteract/fight dodging reflexes.
+        if len(u_forces.shape) >= 2 and u_forces.shape[-2] == 2:
+            eff_forces = u_forces[..., 1, :]
+        else:
+            eff_forces = u_forces
+        loss_eff = jnp.sum(eff_forces**2, axis=-1)
 
         cost_others = (
             w_th  * loss_ang_thorax + 

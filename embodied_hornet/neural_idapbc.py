@@ -143,10 +143,14 @@ def policy_network_icnn(x, target_state=None, action_noise=None, SOG_v_mem=None,
     # 5. THE MUSCLES (Map Forces -> Kinematics)
     muscles = BiologicalKinematicMap()
     mod_tuple = muscles(u_forces_saturated)
-    
     modulations_vector = jnp.stack(mod_tuple, axis=-1)
+
+    net_forces = u_forces_saturated * ScaleConfig.CONTROL_SCALE
+    u_brain_saturated = jnp.tanh(u_forces_newtons / ScaleConfig.CONTROL_SCALE)
+    brain_goal_forces = u_brain_saturated * ScaleConfig.CONTROL_SCALE
+    stacked_forces = jnp.stack([net_forces, brain_goal_forces], axis=-2)
     
-    return modulations_vector, u_forces_saturated * ScaleConfig.CONTROL_SCALE
+    return modulations_vector, stacked_forces
 
 
 # ==============================================================================
