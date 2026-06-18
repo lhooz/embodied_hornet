@@ -95,6 +95,9 @@ def policy_network_icnn(x, target_state=None, action_noise=None, SOG_v_mem=None,
         K_flow_dyn = jax.nn.sigmoid(raw_K[..., 0]) * 1.0 * scale_flow
         K_loom_dyn = jax.nn.sigmoid(raw_K[..., 1]) * 0.5 * scale_loom
 
+    # Saturate the goal-seeking brain forces first (dimensionless ratios in [-1, 1])
+    u_forces_saturated = jnp.tanh(u_forces_newtons / ScaleConfig.CONTROL_SCALE)
+
     # 2. Inject Hassenstein-Reichardt EMD reflexes (Dorsal pathway — LPTC)
     #    emd_signals[..., 0] = HS centering: left-vs-right flow differential
     #    emd_signals[..., 1] = LGMD looming: total unsigned flow energy
@@ -103,14 +106,14 @@ def policy_network_icnn(x, target_state=None, action_noise=None, SOG_v_mem=None,
         looming   = emd_signals[..., 1]
         if dynamic_gains:
             # HS-cell centering: pitch torque correction (steer away from approaching side)
-            u_forces_newtons = u_forces_newtons.at[..., 2].add(K_flow_dyn * centering * ScaleConfig.CONTROL_SCALE[2])
+            u_forces_saturated = u_forces_saturated.at[..., 2].add(K_flow_dyn * centering)
             # LGMD looming escape: forward deceleration (brake when total expansion is high)
-            u_forces_newtons = u_forces_newtons.at[..., 0].add(-K_loom_dyn * looming * ScaleConfig.CONTROL_SCALE[0])
+            u_forces_saturated = u_forces_saturated.at[..., 0].add(-K_loom_dyn * looming)
         else:
             # HS-cell centering: pitch torque correction (steer away from approaching side)
-            u_forces_newtons = u_forces_newtons.at[..., 2].add(K_flow * centering * ScaleConfig.CONTROL_SCALE[2])
+            u_forces_saturated = u_forces_saturated.at[..., 2].add(K_flow * centering)
             # LGMD looming escape: forward deceleration (brake when total expansion is high)
-            u_forces_newtons = u_forces_newtons.at[..., 0].add(-K_loom * looming * ScaleConfig.CONTROL_SCALE[0])
+            u_forces_saturated = u_forces_saturated.at[..., 0].add(-K_loom * looming)
 
     # 3. Inject SOG repulsive forces (Ventral pathway)
     if SOG_v_mem is not None:
@@ -127,26 +130,23 @@ def policy_network_icnn(x, target_state=None, action_noise=None, SOG_v_mem=None,
             robot_pos_slam = rel_pos + 1.0
             
         f_repel = compute_sog_repulsive_force(robot_pos_slam, SOG_v_mem)
-        # Add repulsive forces to Fx (index 0) and Fz (index 1)
-        u_forces_newtons = u_forces_newtons.at[..., 0].add(K_repel * f_repel[..., 0])
-        u_forces_newtons = u_forces_newtons.at[..., 1].add(K_repel * f_repel[..., 1])
+        # Add repulsive forces to Fx (index 0) and Fz (index 1) in ratio space
+        u_forces_saturated = u_forces_saturated.at[..., 0].add(K_repel * f_repel[..., 0] / ScaleConfig.CONTROL_SCALE[0])
+        u_forces_saturated = u_forces_saturated.at[..., 1].add(K_repel * f_repel[..., 1] / ScaleConfig.CONTROL_SCALE[1])
 
-    # 4. Normalize using CONTROL_SCALE
-    raw_ratio = u_forces_newtons / ScaleConfig.CONTROL_SCALE
-    u_forces_saturated = jnp.tanh(raw_ratio) 
-
-    # 5. Apply Action Noise (Post-Tanh)
+    # 4. Apply Action Noise (Post-Tanh) and Clip to biological limits [-1.0, 1.0]
     if action_noise is not None:
         u_forces_saturated = u_forces_saturated + action_noise
-        u_forces_saturated = jnp.clip(u_forces_saturated, -1.0, 1.0)
     
-    # 6. THE MUSCLES (Map Forces -> Kinematics)
+    u_forces_saturated = jnp.clip(u_forces_saturated, -1.0, 1.0)
+    
+    # 5. THE MUSCLES (Map Forces -> Kinematics)
     muscles = BiologicalKinematicMap()
     mod_tuple = muscles(u_forces_saturated)
     
     modulations_vector = jnp.stack(mod_tuple, axis=-1)
     
-    return modulations_vector, u_forces_newtons
+    return modulations_vector, u_forces_saturated * ScaleConfig.CONTROL_SCALE
 
 
 # ==============================================================================

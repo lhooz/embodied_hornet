@@ -498,7 +498,10 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
                     inject_drift=False, autopilot_on=(last_slam_surprise < 0.60),
                     dt=elapsed_time
                 )
-                last_slam_surprise = float(1.0 - float(debug_gates['Raw_Match'][0]))
+                raw_match = float(debug_gates['Raw_Match'][0])
+                conc_place = float(debug_gates['Conc_Place'][0])
+                composite_match = raw_match * conc_place
+                last_slam_surprise = float(1.0 - np.exp(-5.0 * (1.0 - composite_match)))
                 
                 # Use actual CANN SLAM output for position and heading display
                 last_slam_est_u = float(pose_est[0, 0])
@@ -1054,8 +1057,40 @@ def train():
         params = data['params'] 
         opt_state = data['opt_state']
         
+        # Adjust batch size of loaded parameters and optimizer states to match Config.BATCH_SIZE
+        param_batch_size = jax.tree.leaves(params)[0].shape[0]
+        if param_batch_size != Config.BATCH_SIZE:
+            print(f"    -> [BATCH ADAPT] Adapting checkpoint parameters from batch={param_batch_size} to Config.BATCH_SIZE={Config.BATCH_SIZE}")
+            if param_batch_size > Config.BATCH_SIZE:
+                params = jax.tree.map(lambda x: x[:Config.BATCH_SIZE], params)
+                opt_state = jax.tree.map(
+                    lambda x: x[:Config.BATCH_SIZE] if isinstance(x, jnp.ndarray) and len(x.shape) > 0 and x.shape[0] == param_batch_size else x,
+                    opt_state
+                )
+            else:
+                repeats = (Config.BATCH_SIZE + param_batch_size - 1) // param_batch_size
+                params = jax.tree.map(lambda x: jnp.tile(x, (repeats,) + (1,) * (len(x.shape) - 1))[:Config.BATCH_SIZE], params)
+                opt_state = jax.tree.map(
+                    lambda x: jnp.tile(x, (repeats,) + (1,) * (len(x.shape) - 1))[:Config.BATCH_SIZE] if isinstance(x, jnp.ndarray) and len(x.shape) > 0 and x.shape[0] == param_batch_size else x,
+                    opt_state
+                )
+        
         if 'pbt_state' in data:
             pbt_state = data['pbt_state']
+            pbt_batch_size = pbt_state.weights.shape[0]
+            if pbt_batch_size != Config.BATCH_SIZE:
+                print(f"    -> [BATCH ADAPT] Adapting PBT state from batch={pbt_batch_size} to Config.BATCH_SIZE={Config.BATCH_SIZE}")
+                if pbt_batch_size > Config.BATCH_SIZE:
+                    pbt_state = pbt_state._replace(
+                        weights=pbt_state.weights[:Config.BATCH_SIZE],
+                        running_reward=pbt_state.running_reward[:Config.BATCH_SIZE]
+                    )
+                else:
+                    repeats = (Config.BATCH_SIZE + pbt_batch_size - 1) // pbt_batch_size
+                    pbt_state = pbt_state._replace(
+                        weights=jnp.tile(pbt_state.weights, (repeats, 1))[:Config.BATCH_SIZE],
+                        running_reward=jnp.tile(pbt_state.running_reward, (repeats,))[:Config.BATCH_SIZE]
+                    )
             print("    -> PBT State loaded.")
         else:
             pbt_state = init_pbt_state(rng, Config.BATCH_SIZE, Config.PBT_BASE_WEIGHTS)
@@ -1603,7 +1638,10 @@ def train():
             slam_pose_np[0, 2] = float(pose_est[0, 2])
             
             slam_pose = jnp.array(slam_pose_np)
-            slam_surprise = float(1.0 - float(debug_gates['Raw_Match'][0]))
+            raw_match = float(debug_gates['Raw_Match'][0])
+            conc_place = float(debug_gates['Conc_Place'][0])
+            composite_match = raw_match * conc_place
+            slam_surprise = float(1.0 - np.exp(-5.0 * (1.0 - composite_match)))
             slam_vis_csnn = jnp.array(debug_gates['Debug_Input_CSNN'][0])
             slam_vis_stdp = jnp.array(debug_gates['Debug_Input_STDP'][0])
         except Exception as _slam_err:

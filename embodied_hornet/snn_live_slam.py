@@ -36,7 +36,11 @@ def _make_telemetry_step(original_forward_step):
         pose_cl, r_place, r_ring, is_confident, peak_idx_place, debug_gates = result
 
         # Compute surprise from debug gates (same formula as original)
-        surprise = 1.0 - float(debug_gates['Raw_Match'][0])
+        raw_match = float(debug_gates['Raw_Match'][0])
+        conc_place = float(debug_gates['Conc_Place'][0])
+        composite_match = raw_match * conc_place
+        import numpy as np
+        surprise = float(1.0 - np.exp(-5.0 * (1.0 - composite_match)))
 
         # 🌟 SURPRISE TELEMETRY FOR FLIGHT CONTROLLER AWARENESS 🌟
         if surprise >= 0.30:
