@@ -34,3 +34,6 @@ checkpoints_shac/
 # Jupyter
 .ipynb_checkpoints/
 
+# Original hornetRL reference code
+hornetRL-original/
+
