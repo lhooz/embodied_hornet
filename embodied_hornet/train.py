@@ -1919,23 +1919,31 @@ def vis_step_fn(env, curr_state, curr_params, step_idx, slam_surprise, hover_par
     f_repel_scaled = K_repel * f_repel
     
     # Rotate net force (body frame) to global SLAM space
+    # The policy's control output u_forces_newtons is normalized and soft-saturated via jnp.tanh
+    # to [ -1.0, 1.0 ] command ratios (multiplied by ScaleConfig.CONTROL_SCALE).
+    # To prevent raw unsaturated gradients (which can be very large) from extending outside
+    # the visualization bounds, we plot the ACTUAL effective forces sent to the muscles.
+    control_scale_xy = jnp.array([0.05, 0.05])
+    blended_forces_eff = jnp.tanh(blended_forces[0, :2] / control_scale_xy) * control_scale_xy
+    blended_forces_no_emd_eff = jnp.tanh(blended_forces_no_emd[0, :2] / control_scale_xy) * control_scale_xy
+
     theta = sensor_heading_batch[0]
     cos_th = jnp.cos(theta)
     sin_th = jnp.sin(theta)
     
-    f_net_slam_x = blended_forces[0, 0] * cos_th - blended_forces[0, 1] * sin_th
-    f_net_slam_y = blended_forces[0, 0] * sin_th + blended_forces[0, 1] * cos_th
+    f_net_slam_x = blended_forces_eff[0] * cos_th - blended_forces_eff[1] * sin_th
+    f_net_slam_y = blended_forces_eff[0] * sin_th + blended_forces_eff[1] * cos_th
     f_net_slam = jnp.stack([f_net_slam_x, f_net_slam_y])
     
     # EMD contribution in body frame (net force - no emd force)
-    f_emd_body = blended_forces[0, :2] - blended_forces_no_emd[0, :2]
+    f_emd_body = blended_forces_eff - blended_forces_no_emd_eff
     f_emd_slam_x = f_emd_body[0] * cos_th - f_emd_body[1] * sin_th
     f_emd_slam_y = f_emd_body[0] * sin_th + f_emd_body[1] * cos_th
     f_emd_slam = jnp.stack([f_emd_slam_x, f_emd_slam_y])
     
     # Rotate net force without EMD to global SLAM space
-    f_net_no_emd_x = blended_forces_no_emd[0, 0] * cos_th - blended_forces_no_emd[0, 1] * sin_th
-    f_net_no_emd_y = blended_forces_no_emd[0, 0] * sin_th + blended_forces_no_emd[0, 1] * cos_th
+    f_net_no_emd_x = blended_forces_no_emd_eff[0] * cos_th - blended_forces_no_emd_eff[1] * sin_th
+    f_net_no_emd_y = blended_forces_no_emd_eff[0] * sin_th + blended_forces_no_emd_eff[1] * cos_th
     f_net_no_emd_slam = jnp.stack([f_net_no_emd_x, f_net_no_emd_y])
     
     # Brain goal-seeking force in SLAM space (net force without EMD minus SOG force)
