@@ -263,6 +263,7 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
         'f_repel_vec': [],
         'f_brain_vec': [],
         'f_net_vec': [],
+        'f_emd_vec': [],
     }
     
     physics_dt = Config.DT * Config.SIM_SUBSTEPS * steps_per_frame
@@ -392,7 +393,7 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
             
             slam_pose_jax = jnp.array([[slam_est_u, slam_est_v, slam_est_th]])
             vis_step_idx = current_step_counter + Config.WARMUP_STEPS + 5
-            state, f_nodal, w_pose, h_marker, alpha_floored_jax, f_repel_scaled_jax, flow_corr_jax, vis_emd_intensities, f_net_slam_jax, f_brain_slam_jax = vis_step_fn(
+            state, f_nodal, w_pose, h_marker, alpha_floored_jax, f_repel_scaled_jax, flow_corr_jax, vis_emd_intensities, f_net_slam_jax, f_brain_slam_jax, f_emd_slam_jax = vis_step_fn(
                 env, state, params_single, vis_step_idx, jnp.array([last_slam_surprise]), hover_params_single, slam_pose_jax, slam_vis_csnn_jax, slam_vis_stdp_jax, _sog_state.v_mem, Config.K_REPEL, Config.K_FLOW, vis_target_xy, vis_emd_intensities
             )
             current_step_counter += 1
@@ -550,6 +551,7 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
         sim_data['f_repel_vec'].append(np.array(f_repel_scaled_jax.squeeze()))
         sim_data['f_brain_vec'].append(np.array(f_brain_slam_jax.squeeze()))
         sim_data['f_net_vec'].append(np.array(f_net_slam_jax.squeeze()))
+        sim_data['f_emd_vec'].append(np.array(f_emd_slam_jax.squeeze()))
 
         # Real SOG update: ray-cast ToF beams, excite hits, inhibit free space
         tof_d = sim_data['tof'][-1]
@@ -687,6 +689,7 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
     map_target_dir_arr = ax_map.quiver([0], [0], [0], [0], color='#ffcc00', scale=1.0, scale_units='xy', width=0.006, headwidth=4, headlength=5, zorder=16, label='Believed Target Dir')
     map_f_repel_arr = ax_map.quiver([0], [0], [0], [0], color='#ff33ff', scale=1.0, scale_units='xy', width=0.006, headwidth=4, headlength=5, zorder=17, label='SOG Repulsion Force')
     map_f_brain_arr = ax_map.quiver([0], [0], [0], [0], color='#ff8800', scale=1.0, scale_units='xy', width=0.006, headwidth=4, headlength=5, zorder=17, label='Brain Goal Force')
+    map_f_emd_arr = ax_map.quiver([0], [0], [0], [0], color='#39ff14', scale=1.0, scale_units='xy', width=0.006, headwidth=4, headlength=5, zorder=17, label='EMD Reflex Force')
     map_f_net_arr = ax_map.quiver([0], [0], [0], [0], color='#00ffff', scale=1.0, scale_units='xy', width=0.006, headwidth=4, headlength=5, zorder=18, label='Net Control Force')
 
     map_tof_beam_artists = []
@@ -891,6 +894,10 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
                     fb_x, fb_y = sim_data['f_brain_vec'][frame]
                     map_f_brain_arr.set_offsets([[est_u, est_v]])
                     map_f_brain_arr.set_UVC([f_scale * fb_x], [f_scale * fb_y])
+
+                    fe_x, fe_y = sim_data['f_emd_vec'][frame]
+                    map_f_emd_arr.set_offsets([[est_u, est_v]])
+                    map_f_emd_arr.set_UVC([f_scale * fe_x], [f_scale * fe_y])
                     
                     fn_x, fn_y = sim_data['f_net_vec'][frame]
                     map_f_net_arr.set_offsets([[est_u, est_v]])
@@ -1002,7 +1009,7 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
 
         return (patch_thorax, patch_le, patch_hinge, traj_line, hornet_dot, slam_est_line,
                 slam_est_dot, imu_dr_line, imu_dr_dot, heading_arr, slam_heading_arr,
-                target_dir_arr, map_target_dir_arr, map_f_repel_arr, map_f_brain_arr, map_f_net_arr,
+                target_dir_arr, map_target_dir_arr, map_f_repel_arr, map_f_brain_arr, map_f_emd_arr, map_f_net_arr,
                 snn_time_line, telemetry_time_line)
 
     plt.tight_layout()
@@ -1867,6 +1874,10 @@ def vis_step_fn(env, curr_state, curr_params, step_idx, slam_surprise, hover_par
     mods, forces, _ = ac_model.apply(
         curr_params, combined_obs, None, SOG_v_mem, K_repel, emd_signals, K_flow, Config.K_LOOM, slam_pos_batch
     )
+    # 3b. Policy Inference without EMD reflexes (EMD gains set to 0.0)
+    _, forces_no_emd, _ = ac_model.apply(
+        curr_params, combined_obs, None, SOG_v_mem, K_repel, emd_signals, 0.0, 0.0, slam_pos_batch
+    )
     
     # --- LYAPUNOV HOVER & ATTENTION GATING (DNAG) ---
     # Clamp surprise to prevent gate saturation.
@@ -1875,6 +1886,9 @@ def vis_step_fn(env, curr_state, curr_params, step_idx, slam_surprise, hover_par
     if hover_params_single is not None:
         hover_mods, hover_forces, _ = hover_ac_model.apply(
             hover_params_single, scaled_obs, None, SOG_v_mem, K_repel, emd_signals, K_flow, Config.K_LOOM, slam_pos_batch
+        )
+        _, hover_forces_no_emd, _ = hover_ac_model.apply(
+            hover_params_single, scaled_obs, None, SOG_v_mem, K_repel, emd_signals, 0.0, 0.0, slam_pos_batch
         )
     else:
         # Fallback: velocity-zeroed policy
@@ -1885,6 +1899,9 @@ def vis_step_fn(env, curr_state, curr_params, step_idx, slam_surprise, hover_par
         hover_mods, hover_forces, _ = ac_model.apply(
             curr_params, hover_obs, None, SOG_v_mem, K_repel, emd_signals, K_flow, Config.K_LOOM, slam_pos_batch
         )
+        _, hover_forces_no_emd, _ = ac_model.apply(
+            curr_params, hover_obs, None, SOG_v_mem, K_repel, emd_signals, 0.0, 0.0, slam_pos_batch
+        )
         
     blended_mods, alpha = jax.vmap(differentiable_attention_gate)(sim_surprise, mods, hover_mods)
     alpha_floored = jnp.maximum(alpha, Config.DNAG_MIN_ALPHA)
@@ -1892,6 +1909,7 @@ def vis_step_fn(env, curr_state, curr_params, step_idx, slam_surprise, hover_par
     
     # Blend the virtual forces using the same DNAG gate
     blended_forces = (1.0 - alpha_floored) * forces + alpha_floored * hover_forces
+    blended_forces_no_emd = (1.0 - alpha_floored) * forces_no_emd + alpha_floored * hover_forces_no_emd
 
     # 4. Env Step
     next_state, _, f_nodal, w_pose, h_marker = env.step_batch(next_state, blended_mods, step_idx=step_idx)
@@ -1909,14 +1927,25 @@ def vis_step_fn(env, curr_state, curr_params, step_idx, slam_surprise, hover_par
     f_net_slam_y = blended_forces[0, 0] * sin_th + blended_forces[0, 1] * cos_th
     f_net_slam = jnp.stack([f_net_slam_x, f_net_slam_y])
     
-    # Brain goal-seeking force in SLAM space
-    f_brain_slam = f_net_slam - f_repel_scaled[0]
+    # EMD contribution in body frame (net force - no emd force)
+    f_emd_body = blended_forces[0, :2] - blended_forces_no_emd[0, :2]
+    f_emd_slam_x = f_emd_body[0] * cos_th - f_emd_body[1] * sin_th
+    f_emd_slam_y = f_emd_body[0] * sin_th + f_emd_body[1] * cos_th
+    f_emd_slam = jnp.stack([f_emd_slam_x, f_emd_slam_y])
+    
+    # Rotate net force without EMD to global SLAM space
+    f_net_no_emd_x = blended_forces_no_emd[0, 0] * cos_th - blended_forces_no_emd[0, 1] * sin_th
+    f_net_no_emd_y = blended_forces_no_emd[0, 0] * sin_th + blended_forces_no_emd[0, 1] * cos_th
+    f_net_no_emd_slam = jnp.stack([f_net_no_emd_x, f_net_no_emd_y])
+    
+    # Brain goal-seeking force in SLAM space (net force without EMD minus SOG force)
+    f_brain_slam = f_net_no_emd_slam - f_repel_scaled[0]
 
     # Compute EMD-derived centering signal for telemetry
     centering_signal = emd_signals[:, 0]
     flow_corr = K_flow * centering_signal
     
-    return next_state, f_nodal, w_pose, h_marker, alpha_floored, f_repel_scaled, flow_corr, curr_emd_intensities, f_net_slam, f_brain_slam
+    return next_state, f_nodal, w_pose, h_marker, alpha_floored, f_repel_scaled, flow_corr, curr_emd_intensities, f_net_slam, f_brain_slam, f_emd_slam
 
 if __name__ == "__main__":
     import argparse
