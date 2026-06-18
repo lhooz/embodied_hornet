@@ -260,6 +260,9 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
         'alpha': [],
         'f_repel': [],
         'flow_corr': [],
+        'f_repel_vec': [],
+        'f_brain_vec': [],
+        'f_net_vec': [],
     }
     
     physics_dt = Config.DT * Config.SIM_SUBSTEPS * steps_per_frame
@@ -389,7 +392,7 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
             
             slam_pose_jax = jnp.array([[slam_est_u, slam_est_v, slam_est_th]])
             vis_step_idx = current_step_counter + Config.WARMUP_STEPS + 5
-            state, f_nodal, w_pose, h_marker, alpha_floored_jax, f_repel_scaled_jax, flow_corr_jax, vis_emd_intensities = vis_step_fn(
+            state, f_nodal, w_pose, h_marker, alpha_floored_jax, f_repel_scaled_jax, flow_corr_jax, vis_emd_intensities, f_net_slam_jax, f_brain_slam_jax = vis_step_fn(
                 env, state, params_single, vis_step_idx, jnp.array([last_slam_surprise]), hover_params_single, slam_pose_jax, slam_vis_csnn_jax, slam_vis_stdp_jax, _sog_state.v_mem, Config.K_REPEL, Config.K_FLOW, vis_target_xy, vis_emd_intensities
             )
             current_step_counter += 1
@@ -544,6 +547,9 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
         sim_data['alpha'].append(float(alpha_floored_jax.squeeze()))
         sim_data['f_repel'].append(float(jnp.linalg.norm(f_repel_scaled_jax.squeeze())))
         sim_data['flow_corr'].append(float(flow_corr_jax.squeeze()))
+        sim_data['f_repel_vec'].append(np.array(f_repel_scaled_jax.squeeze()))
+        sim_data['f_brain_vec'].append(np.array(f_brain_slam_jax.squeeze()))
+        sim_data['f_net_vec'].append(np.array(f_net_slam_jax.squeeze()))
 
         # Real SOG update: ray-cast ToF beams, excite hits, inhibit free space
         tof_d = sim_data['tof'][-1]
@@ -679,6 +685,9 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
     map_robot_dot, = ax_map.plot([], [], 'o', color='#00ffcc', markersize=5, zorder=10, label='Robot')
     map_trail_line, = ax_map.plot([], [], '-', color='#00ffcc', linewidth=0.8, alpha=0.4, zorder=5, label='Trail')
     map_target_dir_arr = ax_map.quiver([0], [0], [0], [0], color='#ffcc00', scale=1.0, scale_units='xy', width=0.006, headwidth=4, headlength=5, zorder=16, label='Believed Target Dir')
+    map_f_repel_arr = ax_map.quiver([0], [0], [0], [0], color='#ff33ff', scale=1.0, scale_units='xy', width=0.006, headwidth=4, headlength=5, zorder=17, label='SOG Repulsion Force')
+    map_f_brain_arr = ax_map.quiver([0], [0], [0], [0], color='#ff8800', scale=1.0, scale_units='xy', width=0.006, headwidth=4, headlength=5, zorder=17, label='Brain Goal Force')
+    map_f_net_arr = ax_map.quiver([0], [0], [0], [0], color='#00ffff', scale=1.0, scale_units='xy', width=0.006, headwidth=4, headlength=5, zorder=18, label='Net Control Force')
 
     map_tof_beam_artists = []
     for _bc in _beam_colours:
@@ -872,6 +881,21 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
                     # Update believed target direction arrow on SOG map starting at believed body (est_u, est_v)
                     map_target_dir_arr.set_offsets([[est_u, est_v]])
                     map_target_dir_arr.set_UVC([0.2 * ux_believed], [0.2 * uy_believed])
+
+                    # Update force vector arrows starting at believed body (est_u, est_v)
+                    f_scale = 5.0
+                    fr_x, fr_y = sim_data['f_repel_vec'][frame]
+                    map_f_repel_arr.set_offsets([[est_u, est_v]])
+                    map_f_repel_arr.set_UVC([f_scale * fr_x], [f_scale * fr_y])
+                    
+                    fb_x, fb_y = sim_data['f_brain_vec'][frame]
+                    map_f_brain_arr.set_offsets([[est_u, est_v]])
+                    map_f_brain_arr.set_UVC([f_scale * fb_x], [f_scale * fb_y])
+                    
+                    fn_x, fn_y = sim_data['f_net_vec'][frame]
+                    map_f_net_arr.set_offsets([[est_u, est_v]])
+                    map_f_net_arr.set_UVC([f_scale * fn_x], [f_scale * fn_y])
+
                     trail_pts = sim_data['slam_est'][:frame+1]
                     map_trail_line.set_data(
                         [p[0] for p in trail_pts],
@@ -978,7 +1002,8 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
 
         return (patch_thorax, patch_le, patch_hinge, traj_line, hornet_dot, slam_est_line,
                 slam_est_dot, imu_dr_line, imu_dr_dot, heading_arr, slam_heading_arr,
-                target_dir_arr, map_target_dir_arr, snn_time_line, telemetry_time_line)
+                target_dir_arr, map_target_dir_arr, map_f_repel_arr, map_f_brain_arr, map_f_net_arr,
+                snn_time_line, telemetry_time_line)
 
     plt.tight_layout()
     if len(sim_data['states']) == 0:
@@ -1839,7 +1864,7 @@ def vis_step_fn(env, curr_state, curr_params, step_idx, slam_surprise, hover_par
     )
 
     # 3. Policy Inference
-    mods, _, _ = ac_model.apply(
+    mods, forces, _ = ac_model.apply(
         curr_params, combined_obs, None, SOG_v_mem, K_repel, emd_signals, K_flow, Config.K_LOOM, slam_pos_batch
     )
     
@@ -1848,7 +1873,7 @@ def vis_step_fn(env, curr_state, curr_params, step_idx, slam_surprise, hover_par
     sim_surprise = jnp.minimum(slam_surprise, Config.DNAG_MAX_SURPRISE)
     
     if hover_params_single is not None:
-        hover_mods, _, _ = hover_ac_model.apply(
+        hover_mods, hover_forces, _ = hover_ac_model.apply(
             hover_params_single, scaled_obs, None, SOG_v_mem, K_repel, emd_signals, K_flow, Config.K_LOOM, slam_pos_batch
         )
     else:
@@ -1857,7 +1882,7 @@ def vis_step_fn(env, curr_state, curr_params, step_idx, slam_surprise, hover_par
         hover_wrapped = jnp.mod(hover_robot[:, 2] + jnp.pi, 2 * jnp.pi) - jnp.pi
         hover_obs_raw = hover_robot.at[:, 2].set(hover_wrapped)
         hover_obs = jnp.concatenate([symlog(hover_obs_raw), weighted_belief], axis=-1)
-        hover_mods, _, _ = ac_model.apply(
+        hover_mods, hover_forces, _ = ac_model.apply(
             curr_params, hover_obs, None, SOG_v_mem, K_repel, emd_signals, K_flow, Config.K_LOOM, slam_pos_batch
         )
         
@@ -1865,6 +1890,9 @@ def vis_step_fn(env, curr_state, curr_params, step_idx, slam_surprise, hover_par
     alpha_floored = jnp.maximum(alpha, Config.DNAG_MIN_ALPHA)
     blended_mods = (1.0 - alpha_floored) * mods + alpha_floored * hover_mods
     
+    # Blend the virtual forces using the same DNAG gate
+    blended_forces = (1.0 - alpha_floored) * forces + alpha_floored * hover_forces
+
     # 4. Env Step
     next_state, _, f_nodal, w_pose, h_marker = env.step_batch(next_state, blended_mods, step_idx=step_idx)
     
@@ -1872,11 +1900,23 @@ def vis_step_fn(env, curr_state, curr_params, step_idx, slam_surprise, hover_par
     f_repel = compute_sog_repulsive_force(slam_pos_batch, SOG_v_mem)
     f_repel_scaled = K_repel * f_repel
     
+    # Rotate net force (body frame) to global SLAM space
+    theta = sensor_heading_batch[0]
+    cos_th = jnp.cos(theta)
+    sin_th = jnp.sin(theta)
+    
+    f_net_slam_x = blended_forces[0, 0] * cos_th - blended_forces[0, 1] * sin_th
+    f_net_slam_y = blended_forces[0, 0] * sin_th + blended_forces[0, 1] * cos_th
+    f_net_slam = jnp.stack([f_net_slam_x, f_net_slam_y])
+    
+    # Brain goal-seeking force in SLAM space
+    f_brain_slam = f_net_slam - f_repel_scaled[0]
+
     # Compute EMD-derived centering signal for telemetry
     centering_signal = emd_signals[:, 0]
     flow_corr = K_flow * centering_signal
     
-    return next_state, f_nodal, w_pose, h_marker, alpha_floored, f_repel_scaled, flow_corr, curr_emd_intensities
+    return next_state, f_nodal, w_pose, h_marker, alpha_floored, f_repel_scaled, flow_corr, curr_emd_intensities, f_net_slam, f_brain_slam
 
 if __name__ == "__main__":
     import argparse
