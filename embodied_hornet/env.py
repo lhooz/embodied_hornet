@@ -435,7 +435,7 @@ class FlyEnv:
         loss_ang_vel = jnp.sum(err[:, 6:8]**2, axis=1)
         # Penalize the raw ICNN goal force (index 1 of axis -2) instead of net force
         # to prevent the brain from learning to counteract/fight dodging reflexes.
-        if len(u_forces.shape) >= 2 and u_forces.shape[-2] == 2:
+        if len(u_forces.shape) >= 2 and u_forces.shape[-2] >= 2:
             eff_forces = u_forces[..., 1, :]
         else:
             eff_forces = u_forces

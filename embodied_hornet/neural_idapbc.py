@@ -57,9 +57,9 @@ def compute_sog_repulsive_force(robot_pos_slam, SOG_v_mem, map_size=2.0):
 
 def policy_network_icnn(x, target_state=None, action_noise=None, SOG_v_mem=None, K_repel=0.0,
                         emd_signals=None, K_flow=0.0, K_loom=0.0, robot_pos_slam=None,
-                        dynamic_gains=True):
+                        dynamic_gains=True, instar_belief=None, K_instar=1.0):
     """
-    Full Policy Pipeline: Brain -> Muscles (Enhanced with SOG & EMD avoidance).
+    Full Policy Pipeline: Brain -> Muscles (Enhanced with SOG, EMD, and Instar memory avoidance).
     
     Maps normalized observations to biological CPG modulation parameters.
     
@@ -134,13 +134,17 @@ def policy_network_icnn(x, target_state=None, action_noise=None, SOG_v_mem=None,
         u_forces_saturated = u_forces_saturated.at[..., 0].add(K_repel * f_repel[..., 0] / ScaleConfig.CONTROL_SCALE[0])
         u_forces_saturated = u_forces_saturated.at[..., 1].add(K_repel * f_repel[..., 1] / ScaleConfig.CONTROL_SCALE[1])
 
-    # 4. Apply Action Noise (Post-Tanh) and Clip to biological limits [-1.0, 1.0]
+    # 4. Inject Instar visual-spatial memory forces (Ventral stream feedforward)
+    if instar_belief is not None:
+        u_forces_saturated = u_forces_saturated + K_instar * instar_belief
+
+    # 5. Apply Action Noise (Post-Tanh) and Clip to biological limits [-1.0, 1.0]
     if action_noise is not None:
         u_forces_saturated = u_forces_saturated + action_noise
     
     u_forces_saturated = jnp.clip(u_forces_saturated, -1.0, 1.0)
     
-    # 5. THE MUSCLES (Map Forces -> Kinematics)
+    # 6. THE MUSCLES (Map Forces -> Kinematics)
     muscles = BiologicalKinematicMap()
     mod_tuple = muscles(u_forces_saturated)
     modulations_vector = jnp.stack(mod_tuple, axis=-1)
@@ -148,7 +152,13 @@ def policy_network_icnn(x, target_state=None, action_noise=None, SOG_v_mem=None,
     net_forces = u_forces_saturated * ScaleConfig.CONTROL_SCALE
     u_brain_saturated = jnp.tanh(u_forces_newtons / ScaleConfig.CONTROL_SCALE)
     brain_goal_forces = u_brain_saturated * ScaleConfig.CONTROL_SCALE
-    stacked_forces = jnp.stack([net_forces, brain_goal_forces], axis=-2)
+    
+    if instar_belief is not None:
+        instar_forces = K_instar * instar_belief * ScaleConfig.CONTROL_SCALE
+    else:
+        instar_forces = jnp.zeros_like(net_forces)
+        
+    stacked_forces = jnp.stack([net_forces, brain_goal_forces, instar_forces], axis=-2)
     
     return modulations_vector, stacked_forces
 
