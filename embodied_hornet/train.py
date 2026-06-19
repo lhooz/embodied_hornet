@@ -218,12 +218,12 @@ def hover_actor_fn(physical_state, action_noise=None, SOG_v_mem=None, K_repel=0.
         physical_state,
         target_state=target_sym,
         action_noise=action_noise,
-        SOG_v_mem=None,
-        K_repel=0.0,
-        emd_signals=None,
-        K_flow=0.0,
-        K_loom=0.0,
-        robot_pos_slam=None,
+        SOG_v_mem=SOG_v_mem,
+        K_repel=K_repel,
+        emd_signals=emd_signals,
+        K_flow=K_flow,
+        K_loom=K_loom,
+        robot_pos_slam=robot_pos_slam,
         dynamic_gains=False
     )
     # Critic on 8D state (matching hover_params.pkl structure)
