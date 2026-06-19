@@ -513,10 +513,11 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
                 last_slam_est_th = float(pose_est[0, 2])
                 
                 # Print professional telemetry tracking
+                gt_pitch = ((r_state_np[2] - 1.0 + np.pi) % (2 * np.pi)) - np.pi
                 est_pitch = float(pose_est[0, 2])
                 est_grav = float(vis_slam._theta_gravity[0])
                 print(f"  📊 [SLAM TELEMETRY] Step {i:03d} | Pos GT: ({slam_u:.2f}, {slam_v:.2f}) SLAM: ({last_slam_est_u:.2f}, {last_slam_est_v:.2f}) "
-                      f"| Pitch GT: {r_state_np[2] - 1.0:.3f} rad, CF Grav: {est_grav:.3f} rad, CANN Head: {est_pitch:.3f} rad | Surprise: {last_slam_surprise:.3f}")
+                      f"| Pitch GT: {gt_pitch:.3f} rad, CF Grav: {est_grav:.3f} rad, CANN Head: {est_pitch:.3f} rad | Surprise: {last_slam_surprise:.3f}")
                 
                 slam_vis_csnn_jax = jnp.array(debug_gates['Debug_Input_CSNN'])
                 slam_vis_stdp_jax = jnp.array(debug_gates['Debug_Input_STDP'])
