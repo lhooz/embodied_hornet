@@ -1369,9 +1369,10 @@ def train():
             visual_features = (norm_csnn, norm_stdp)
             
             # CRITICAL: Normalize u_brain from raw Newtons to [-1,1] saturated commands
-            # before feeding as the Instar Hebbian target signal. Use the net effective force
-            # (index 0) so the vision stream can learn and associate obstacle dodge responses/reflexes.
-            u_brain_net = u_brain[:, 0, :]
+            # before feeding as the Instar Hebbian target signal. Use the feedback-only force
+            # (net force minus Instar memory force) so that the memory is trained as a Feedback
+            # Error Learning (FEL) system, avoiding self-excitation/double-counting.
+            u_brain_net = u_brain[:, 0, :] - u_brain[:, 2, :]
             u_brain_saturated = jnp.tanh(u_brain_net / Config.FORCE_NORMALIZER)
             next_full, next_weighted_belief = env.ingest_perceptual_streams(
                 next_full, pose_belief, visual_features, u_brain_saturated
