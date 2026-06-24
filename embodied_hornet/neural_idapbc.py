@@ -172,8 +172,40 @@ def policy_network_icnn(x, target_state=None, action_noise=None, SOG_v_mem=None,
         u_forces_saturated = u_forces_saturated.at[..., 1].add(K_repel * f_repel[..., 1] / ScaleConfig.CONTROL_SCALE[1])
 
     # 4. Inject Instar visual-spatial memory forces (Ventral stream feedforward)
+    instar_gate = 1.0
     if instar_belief is not None:
-        u_forces_saturated = u_forces_saturated + K_instar * instar_belief
+        instar_gate = jnp.ones(instar_belief.shape[:-1])
+        if SOG_v_mem is not None:
+            N = SOG_v_mem.shape[-1]
+            coords = jnp.linspace(0.0, 2.0, N)
+            X, Z = jnp.meshgrid(coords, coords, indexing='ij')
+            cell_positions = jnp.stack([X, Z], axis=-1)  # (N, N, 2)
+            
+            disp = cell_positions - robot_pos_slam[..., None, None, :]
+            dist_sq = jnp.sum(disp**2, axis=-1) + 2.5e-3
+            dist = jnp.sqrt(dist_sq)
+            
+            # Compute relative angle of cells to heading
+            dx = disp[..., 0]
+            dz = disp[..., 1]
+            cell_phi = jnp.atan2(dz, dx)
+            
+            h_expanded = heading[..., None, None]
+            delta_phi = jnp.mod(cell_phi - h_expanded + jnp.pi, 2 * jnp.pi) - jnp.pi
+            
+            # Soft FOV mask: event camera FOV is 90° (+/- 45° or +/- pi/4 rad)
+            fov_mask = jax.nn.sigmoid(20.0 * (jnp.pi / 4 - jnp.abs(delta_phi)))
+            
+            active_mask = jnp.maximum(SOG_v_mem, 0.0)
+            
+            # Instar Proximity Envelope: active under 40cm down to 5cm
+            d_max_instar = 0.40
+            d_min_instar = 0.05
+            u_instar = jnp.maximum((d_max_instar - dist) / (d_max_instar - d_min_instar), 0.0)
+            instar_cell_proximity = active_mask * (u_instar ** 2) * fov_mask
+            instar_gate = jnp.max(instar_cell_proximity, axis=(-2, -1))
+            
+        u_forces_saturated = u_forces_saturated + K_instar * instar_gate[..., None] * instar_belief
 
     # 5. Apply Action Noise (Post-Tanh) and Clip to biological limits [-1.0, 1.0]
     if action_noise is not None:
@@ -185,13 +217,13 @@ def policy_network_icnn(x, target_state=None, action_noise=None, SOG_v_mem=None,
     muscles = BiologicalKinematicMap()
     mod_tuple = muscles(u_forces_saturated)
     modulations_vector = jnp.stack(mod_tuple, axis=-1)
-
+ 
     net_forces = u_forces_saturated * ScaleConfig.CONTROL_SCALE
     u_brain_saturated = jnp.tanh(u_forces_newtons / ScaleConfig.CONTROL_SCALE)
     brain_goal_forces = u_brain_saturated * ScaleConfig.CONTROL_SCALE
     
     if instar_belief is not None:
-        instar_forces = K_instar * instar_belief * ScaleConfig.CONTROL_SCALE
+        instar_forces = K_instar * instar_gate[..., None] * instar_belief * ScaleConfig.CONTROL_SCALE
     else:
         instar_forces = jnp.zeros_like(net_forces)
         
