@@ -392,7 +392,7 @@ class FlyEnv:
         
         return updated_state, weighted_perceptual_belief
 
-    def get_reward_metrics(self, robot_state, u_forces, reward_weights, target=None):
+    def get_reward_metrics(self, robot_state, u_forces, reward_weights, target=None, speed_reward_weight=0.5):
         """
         Calculates the scalar reward and detailed cost breakdown.
         Uses 'Honeypot' Precision Reward + 'Soft Barrier' Safety Penalty.
@@ -415,6 +415,16 @@ class FlyEnv:
         w_nudge = 1.0 * w_pos 
         linear_error = jnp.abs(err[:, 0]) + jnp.abs(err[:, 1])
         rew_linear_nudge = -w_nudge * linear_error
+
+        # --- 3b. Speed Reward (The "Engine" - encourage speed towards target) ---
+        w_speed = speed_reward_weight * w_pos
+        # Vector pointing to target is -err[:, :2]
+        target_dir = -err[:, :2] / (dist[:, None] + 1e-6)
+        # Project velocity onto target direction
+        v_to_target = jnp.sum(robot_state[:, 4:6] * target_dir, axis=1)
+        # Decay speed reward to 0 within 10cm of target to prevent overshoot
+        speed_gate = jnp.minimum(dist / 0.1, 1.0)
+        rew_speed = w_speed * v_to_target * speed_gate
 
         # --- 4. Safety Penalty (The "Electric Fence") ---
         wall_limit = 0.20
@@ -449,7 +459,7 @@ class FlyEnv:
             w_eff * loss_eff
         )
 
-        raw_reward = rew_precision + rew_linear_nudge + rew_safety - cost_others        
+        raw_reward = rew_precision + rew_linear_nudge + rew_safety + rew_speed - cost_others        
         scaled_reward = raw_reward * 0.02 
         
         metrics = {
@@ -460,7 +470,8 @@ class FlyEnv:
             'vel_lin': loss_lin_vel,  
             'vel_ang': loss_ang_vel,  
             'ferr': loss_eff,
-            'ang': loss_ang_thorax + loss_ang_abdomen
+            'ang': loss_ang_thorax + loss_ang_abdomen,
+            'rew_speed': rew_speed
         }
         return scaled_reward, metrics
 
@@ -470,6 +481,7 @@ class FlyEnv:
         robot_state_single: np.ndarray,
         prev_intensities: np.ndarray,
         dt: float = 0.00216,
+        override_w_theta: float = None,
     ):
         """
         Computes event-camera, ToF, and kinematic odometry for ONE agent.
@@ -556,6 +568,9 @@ class FlyEnv:
             self._prev_v_glob = [vx_glob, vz_glob]
             
         self._prev_robot_state = robot_state_single.copy()
+
+        if override_w_theta is not None:
+            w_theta = override_w_theta
 
         # Convert global velocities [vx_glob, vz_glob] to forward/lateral in the sensor-frame
         # to match the CANN and cerebellum's expected coordinate system.

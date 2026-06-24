@@ -52,7 +52,7 @@ def _get_ray_indices(cx, cy, cth, tof_dists, tof_angles, res, grid_size, offset_
     hit_idx, free_idx = [], []
     MAX_VALID_RANGE = 2.83  # max diagonal of 2m×2m room = √(2²+2²)
 
-    for i in range(3):
+    for i in range(len(tof_angles)):
         d = float(tof_dists[i])
         trace_dist = min(d, MAX_VALID_RANGE)
         # Free-space cells along the beam
@@ -113,21 +113,23 @@ class Config:
     LR_WARMUP_STEPS = 50        # ramp LR from LR_ACTOR/50 → LR_ACTOR over this many steps
     MAX_GRAD_NORM = 1.0
     GAMMA = 0.99
-    DNAG_MIN_ALPHA = 0.3        # hover specialist always contributes ≥30% of the blend
-                                # prevents SHAC's random critic from destroying hover stability
+    DNAG_MIN_ALPHA = 0.0        # hover specialist minimum contribution (0 = active seeker can have 100% control)
+    DNAG_MAX_ALPHA = 0.7        # hover specialist maximum contribution (capping ensures active seeker always gets trained/has say)
     DNAG_MAX_SURPRISE = 0.4     # clamp surprise to 0.4 to prevent gate saturation at 1.0
+    SPEED_REWARD_WEIGHT = 0.5   # weight for speed reward relative to position reward tracking weight
 
     OBS_NOISE_SIGMA = 0.002  
     ACTION_NOISE_SIGMA = 0.2
+    K_CORR = 0.05           # Proportional feedback correction gain from CANN SLAM -> dead-reckoning
 
     TOTAL_UPDATES = 100000
     VIS_INTERVAL = 100
     CURRICULUM_RATIO = 0.5
     
     # --- Obstacle Avoidance Gains ---
-    K_REPEL = 0.05
-    K_FLOW = 1.0         # HS centering reflex gain (Dorsal stream — pitch torque)
-    K_LOOM = 0.8         # LGMD looming escape gain (Dorsal stream — forward deceleration)
+    K_REPEL = 0.03
+    K_FLOW = 12.0        # HS centering reflex gain (Dorsal stream — pitch torque)
+    K_LOOM = 6.0         # LGMD looming escape gain (Dorsal stream — forward deceleration)
     K_INSTAR = 1.0       # Instar visual-spatial memory feedback gain
     N_EMD_PIX = 32       # Coarse ommatidial array resolution (Dorsal stream)
     EMD_TAU_BASE = 0.05       # Base EMD delay time constant (seconds) at 0 speed
@@ -159,9 +161,34 @@ class Config:
 
     FORCE_NORMALIZER = ScaleConfig.CONTROL_SCALE
 
-# --- Observation Scaling SYMLOG ---
 def symlog(x):
     return jnp.sign(x) * jnp.log1p(jnp.abs(x))
+
+
+def get_valid_target(rng_key, obstacles_np, slam_scale, minval=-0.8, maxval=0.8):
+    """
+    Samples a target coordinate that is outside any obstacle bounding box.
+    Done in CPU/NumPy to simplify sampling loop.
+    """
+    import numpy as np
+    k = rng_key
+    while True:
+        k, subk = jax.random.split(k)
+        candidate = jax.random.uniform(subk, (2,), minval=minval, maxval=maxval)
+        candidate_np = np.array(candidate)
+        sx = candidate_np[0] * slam_scale + 1.0
+        sz = candidate_np[1] * slam_scale + 1.0
+        
+        if len(obstacles_np) == 0:
+            return candidate, k
+        
+        in_obs = np.any(
+            (obstacles_np[:, 0] <= sx) & (obstacles_np[:, 2] >= sx) &
+            (obstacles_np[:, 1] <= sz) & (obstacles_np[:, 3] >= sz)
+        )
+        if not in_obs:
+            return candidate, k
+
 
 # ==============================================================================
 # 2. MODEL DEFINITION
@@ -282,10 +309,10 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
     # Extract the best agent's parameters
     params_single = jax.tree.map(lambda x: x[best_idx], params)
     
-    # Extract the best agent's state or reset if not provided
+    # Extract Agent 0's state or reset if not provided (always use Agent 0 to match SLAM/SOG)
     if curr_state is not None:
-        state = jax.tree.map(lambda x: x[best_idx : best_idx + 1], curr_state)
-        print(f"    -> Resuming from exploration history (spawn pose: {state[0][0, :3]})")
+        state = jax.tree.map(lambda x: x[0 : 1], curr_state)
+        print(f"    -> Resuming from exploration history of Agent 0 (spawn pose: {state[0][0, :3]})")
     else:
         rng = jax.random.PRNGKey(update_idx)
         state = env.reset(rng, 1)
@@ -295,26 +322,10 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
     # Copy the SLAM system if provided, otherwise create a new one
     if slam_system is not None:
         vis_slam = copy.deepcopy(slam_system)
-        if best_idx != 0:
-            # We must reset and initialize the pose tracker to match the best agent's training SLAM pose
-            start_slam_x = float(slam_pose[best_idx, 0])
-            start_slam_z = float(slam_pose[best_idx, 1])
-            start_slam_th = float(slam_pose[best_idx, 2])
-            
-            vis_slam.reset_pose_only(1)
-            vis_slam.initialize_pose(
-                jnp.array([[start_slam_x, start_slam_z]]),
-                jnp.array([start_slam_th]),
-            )
-            last_slam_est_u = start_slam_x
-            last_slam_est_v = start_slam_z
-            last_slam_est_th = start_slam_th
-            print(f"    -> Deepcopied SLAM system but reset & re-initialized pose to best agent ({best_idx}) start: ({last_slam_est_u:.2f}, {last_slam_est_v:.2f})")
-        else:
-            last_slam_est_u = float(slam_pose[0, 0])
-            last_slam_est_v = float(slam_pose[0, 1])
-            last_slam_est_th = float(slam_pose[0, 2])
-            print(f"    -> Deepcopied SLAM system from training run at pose ({last_slam_est_u:.2f}, {last_slam_est_v:.2f})")
+        last_slam_est_u = float(slam_pose[0, 0])
+        last_slam_est_v = float(slam_pose[0, 1])
+        last_slam_est_th = float(slam_pose[0, 2])
+        print(f"    -> Deepcopied Agent 0 SLAM system from training run at pose ({last_slam_est_u:.2f}, {last_slam_est_v:.2f})")
     else:
         from snn_slam_system import SNNSLAMSystem
         vis_slam = SNNSLAMSystem(jax.random.PRNGKey(update_idx + 999), n_depth=N_DEPTH)
@@ -342,6 +353,8 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
     slam_est_u = last_slam_est_u
     slam_est_v = last_slam_est_v
     slam_est_th = last_slam_est_th
+    
+    last_sensor_heading = last_slam_est_th
 
     last_active_places = np.array([], dtype=np.int32)
     last_slam_surprise = float(slam_surprise) if slam_surprise is not None else 0.0
@@ -373,13 +386,13 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
     else:
         _sog_state = _sog.init_state()
 
-    _TOF_ANGLES = [-np.pi/4, 0.0, np.pi/4]
+    _TOF_ANGLES = [-np.pi/4, 0.0, np.pi/4, np.pi]
     sim_data['sog_states'] = []  # per-frame v_mem snapshots for animation replay
 
-    # Target waypoint: if target_xy is provided, use the best agent's active target
+    # Target waypoint: if target_xy is provided, use Agent 0's active target
     if target_xy is not None:
-        vis_target_xy = target_xy[best_idx : best_idx + 1]
-        print(f"    -> Using best agent's target waypoint: {vis_target_xy}")
+        vis_target_xy = target_xy[0 : 1]
+        print(f"    -> Using Agent 0's target waypoint: {vis_target_xy}")
     else:
         vis_target_xy = jnp.array([[0.5, -0.5]])
 
@@ -431,9 +444,9 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
         # Camera/sensor heading is body pitch - 1.0 rad (facing forward)
         sensor_heading = float(r_state_np[2]) - 1.0
         
-        # ToF: 3 beam distances from current SLAM position + sensor heading
+        # ToF: 4 beam distances from current SLAM position + sensor heading (including back beam)
         _tof_jax = compute_tof_distance(
-            jnp.array([slam_u, slam_v]), sensor_heading, env._segments
+            jnp.array([slam_u, slam_v]), sensor_heading, env._segments, include_back=True
         )
         sim_data['tof'].append(np.array(_tof_jax))
         sim_data['heading'].append(sensor_heading)
@@ -452,9 +465,14 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
             r_st_start_10 = np.array(r_st_start)
 
         # Dead-reckoning position integrator (high frequency)
+        # Position: use raw state velocities (models IMU/optic-flow velocity sensor)
         dr_vx = float(r_state_np[4]) * env._slam_scale
         dr_vz = float(r_state_np[5]) * env._slam_scale
-        dr_vth = float(r_state_np[6]) # angular velocity (yaw rate)
+        # Heading: use AHRS-style heading differences (filters wingbeat oscillations)
+        dr_vth = (sensor_heading - last_sensor_heading + np.pi) % (2 * np.pi) - np.pi
+        dr_vth = dr_vth / physics_dt
+        
+        last_sensor_heading = sensor_heading
         
         # Integrate raw IMU dead-reckoning (velocities from state vector are already global frame)
         dr_vx_glob = dr_vx
@@ -467,7 +485,7 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
         sim_data['imu_dr'].append((raw_imu_x, raw_imu_z, raw_imu_th))
         
         # Proportional feedback correction towards CANN estimate (prevents steps/discontinuities)
-        K_CORR = 20.0
+        K_CORR = Config.K_CORR
         err_x = last_slam_est_u - dr_x
         err_z = last_slam_est_v - dr_z
         err_th = last_slam_est_th - dr_th
@@ -491,20 +509,21 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
             
             # SLAM tracking for visualization - run once per 10 steps (50Hz)
             env._prev_robot_state = r_st_start_10
+            avg_w_theta = kin_acc[2] / kin_count if kin_count > 0 else 0.0
             ev_jax, kin_jax, tof_jax, acc_jax, slam_prev_int = env.compute_slam_sensors(
-                r_state_np, slam_prev_int, dt=elapsed_time
+                r_state_np, slam_prev_int, dt=elapsed_time, override_w_theta=avg_w_theta
             )
             
             try:
                 pose_est, _, _, _, _, debug_gates = vis_slam.forward_step(
                     ev_jax, kin_jax, tof_jax,
                     acc_t=acc_jax,
-                    inject_drift=False, autopilot_on=(last_slam_surprise < 0.60),
+                    inject_drift=False, autopilot_on=True,
                     dt=elapsed_time
                 )
                 raw_match = float(debug_gates['Raw_Match'][0])
                 conc_place = float(debug_gates['Conc_Place'][0])
-                composite_match = raw_match * conc_place
+                composite_match = raw_match
                 last_slam_surprise = float(1.0 - np.exp(-5.0 * (1.0 - composite_match)))
                 
                 # Use actual CANN SLAM output for position and heading display
@@ -651,8 +670,8 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
     vel_arr = ax_nav.quiver([0], [0], [0], [0], color='#ff33ff', scale=1.0, scale_units='xy', width=0.006, headwidth=4, headlength=5, zorder=16, label='Velocity')
     target_dir_arr = ax_nav.quiver([0], [0], [0], [0], color='#ffcc00', scale=1.0, scale_units='xy', width=0.006, headwidth=4, headlength=5, zorder=17, label='Believed Target Dir')
 
-    # 3 ToF beam artists
-    _beam_colours = ['#00aaff', '#ffff44', '#00aaff']
+    # 4 ToF beam artists
+    _beam_colours = ['#00aaff', '#ffff44', '#00aaff', '#ff5555']
     tof_beam_artists = []
     for _bc in _beam_colours:
         _bl, = ax_nav.plot([], [], '-',  color=_bc, linewidth=1.5, alpha=0.85, zorder=12)
@@ -787,22 +806,23 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
     for spine in ax_telemetry_right.spines.values():
         spine.set_edgecolor('#444444')
         
-    # Plot SOG Repulsion in normalized units (divided by force control scale 0.05 N)
-    sog_ratio = np.array(sim_data['f_repel']) / 0.05
-    line_repel, = ax_telemetry_right.plot(time_series, sog_ratio, '-', color='#ff33ff', linewidth=1.2, label='SOG Repulsion')
+    # Plot SOG Force in physical Newtons
+    f_repel_np = np.array(sim_data['f_repel'])
+    line_repel, = ax_telemetry_right.plot(time_series, f_repel_np, '-', color='#ff33ff', linewidth=1.2, label='SOG Force (N)')
     
-    # Plot EMD Centering in normalized units (flow_corr is already a CPG torque input ratio)
-    line_emd, = ax_telemetry_right.plot(time_series, sim_data['flow_corr'], '-', color='#39ff14', linewidth=1.2, label='EMD Centering')
+    # Plot EMD Force in physical Newtons
+    f_emd_np = np.array([np.linalg.norm(v) for v in sim_data['f_emd_vec']])
+    line_emd, = ax_telemetry_right.plot(time_series, f_emd_np, '-', color='#39ff14', linewidth=1.2, label='EMD Force (N)')
     
-    max_repel_ratio = max(sog_ratio) if len(sog_ratio) > 0 else 1.0
-    max_emd_ratio = max(abs(x) for x in sim_data['flow_corr']) if sim_data['flow_corr'] else 1.0
-    max_val = max(max_repel_ratio, max_emd_ratio)
-    if max_val <= 0.0: max_val = 1.0
+    # Plot Instar Force in physical Newtons
+    f_instar_np = np.array([np.linalg.norm(v) for v in sim_data['f_instar_vec']])
+    line_instar, = ax_telemetry_right.plot(time_series, f_instar_np, '-', color='#ffff33', linewidth=1.2, label='Instar Force (N)')
     
-    ax_telemetry_right.set_ylim(-max_val * 1.1, max_val * 1.1)
-    ax_telemetry_right.set_ylabel('Reflex Action (Ratio of Max)', color='#cccccc', fontsize=8)
+    max_val = 0.30
+    ax_telemetry_right.set_ylim(-0.01, max_val * 1.1)
+    ax_telemetry_right.set_ylabel('Force (Newtons)', color='#cccccc', fontsize=8)
 
-    lines = [line_surprise, line_alpha, line_repel, line_emd]
+    lines = [line_surprise, line_alpha, line_repel, line_emd, line_instar]
     labels = [l.get_label() for l in lines]
     ax_telemetry.legend(lines, labels, loc='upper left', facecolor='#222222', labelcolor='white', fontsize=7)
     
@@ -896,7 +916,7 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
                     map_target_dir_arr.set_UVC([0.2 * ux_believed], [0.2 * uy_believed])
 
                     # Update force vector arrows starting at believed body (est_u, est_v)
-                    f_scale = 5.0
+                    f_scale = 2.0833
                     fr_x, fr_y = sim_data['f_repel_vec'][frame]
                     map_f_repel_arr.set_offsets([[est_u, est_v]])
                     map_f_repel_arr.set_UVC([f_scale * fr_x], [f_scale * fr_y])
@@ -925,7 +945,7 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
 
                     # Update ToF beams on SOG map
                     for bi, ((bl, bm), offset) in enumerate(
-                            zip(map_tof_beam_artists, [-np.pi/4, 0.0, np.pi/4])):
+                            zip(map_tof_beam_artists, [-np.pi/4, 0.0, np.pi/4, np.pi])):
                         ang = est_th + offset
                         hu  = est_u + tof_d[bi] * np.cos(ang)
                         hv  = est_v + tof_d[bi] * np.sin(ang)
@@ -941,9 +961,9 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
                         [est_u, est_u + fov_r * np.cos(est_th + np.pi/4)],
                         [est_v, est_v + fov_r * np.sin(est_th + np.pi/4)])
 
-                # 3 ToF beams: left/center/right at ±45° from heading
+                # 4 ToF beams: left/center/right at ±45° and back at 180° from heading
                 for bi, ((bl, bm), offset) in enumerate(
-                        zip(tof_beam_artists, [-np.pi/4, 0.0, np.pi/4])):
+                        zip(tof_beam_artists, [-np.pi/4, 0.0, np.pi/4, np.pi])):
                     ang = hdg + offset
                     hu  = cu + tof_d[bi] * np.cos(ang)
                     hv  = cv + tof_d[bi] * np.sin(ang)
@@ -1346,14 +1366,14 @@ def train():
                 )
 
             # Fully differentiable attention gate blending.
-            # DNAG_MIN_ALPHA enforces a hover-specialist floor: even when SLAM
-            # surprise is near zero (familiar territory / near target), the hover
-            # specialist always contributes at least MIN_ALPHA of the action.
-            # This prevents the SHAC policy's random critic from fully overriding
-            # the hover-stable ICNN weights during early training.
+            # DNAG_MAX_ALPHA prevents the hover specialist from fully taking over (1.0)
+            # during high surprise, ensuring the active seeker always contributes at least
+            # (1.0 - DNAG_MAX_ALPHA) of the control action to collect gradients and learn.
+            # DNAG_MIN_ALPHA lets the hover specialist drop to 0.0 when surprise is 0.0.
             blended_mods, alpha = jax.vmap(differentiable_attention_gate)(sim_surprise, mods, hover_mods)
-            alpha_floored = jnp.maximum(alpha, Config.DNAG_MIN_ALPHA)
-            blended_mods  = (1.0 - alpha_floored) * mods + alpha_floored * hover_mods
+            alpha_blended = jnp.minimum(alpha, Config.DNAG_MAX_ALPHA)
+            alpha_blended = jnp.maximum(alpha_blended, Config.DNAG_MIN_ALPHA)
+            blended_mods  = (1.0 - alpha_blended) * mods + alpha_blended * hover_mods
             
             # 4. Environment Step (Physics uses the blended passivity-preserving actions)
             next_full, f_actual, _, _, _ = env.step_batch(curr_full, blended_mods, step_idx=p_idx)
@@ -1383,7 +1403,7 @@ def train():
             target_state_batch = target_state_batch.at[:, :2].set(target_xy)
             target_state_batch = target_state_batch.at[:, 2].set(Config.TARGET_STATE[2])
             target_state_batch = target_state_batch.at[:, 3].set(Config.TARGET_STATE[3])
-            rew_scaled, met = env.get_reward_metrics(curr_robot, u_brain, pbt_weights, target=target_state_batch)
+            rew_scaled, met = env.get_reward_metrics(curr_robot, u_brain, pbt_weights, target=target_state_batch, speed_reward_weight=Config.SPEED_REWARD_WEIGHT)
 
             # --- OBSTACLE COLLISION PENALTY (differentiable gradient signal) ---
             # Convert physical (x, z) → SLAM space and compute signed distance to obstacles.
@@ -1523,8 +1543,13 @@ def train():
     print(f"=== Starting Training: Step {start_step} to {Config.TOTAL_UPDATES} ===")
     rng, key_reset = jax.random.split(rng)
     curr_state = env.reset(key_reset, Config.BATCH_SIZE)
-    rng, key_tgt = jax.random.split(rng)
-    target_xy = jax.random.uniform(key_tgt, (Config.BATCH_SIZE, 2), minval=-0.8, maxval=0.8)
+    _obs_np = np.array(env._obstacles) if env._obstacles is not None else np.zeros((0, 4))
+    new_target_list = []
+    for idx in range(Config.BATCH_SIZE):
+        rng, key_tgt = jax.random.split(rng)
+        valid_tgt, _ = get_valid_target(rng, _obs_np, float(env._slam_scale))
+        new_target_list.append(np.array(valid_tgt))
+    target_xy = jnp.array(new_target_list)
     
     # --- Initialise SLAM System ---
     # One SNNSLAMSystem tracks agent-0's trajectory and provides real pose + surprise
@@ -1629,7 +1654,7 @@ def train():
             for _ in range(3):
                 pose_est, _, _, _, _, debug_gates = slam_system.forward_step(
                     ev_jax, kin_jax, tof_jax, acc_t=acc_jax,
-                    inject_drift=False, autopilot_on=(slam_surprise < 0.60),
+                    inject_drift=False, autopilot_on=True,
                     dt=dt_per_cann_step
                 )
             # Virtual Displacement Tracking: integrate relative odometry for all agents
@@ -1653,7 +1678,7 @@ def train():
             slam_pose = jnp.array(slam_pose_np)
             raw_match = float(debug_gates['Raw_Match'][0])
             conc_place = float(debug_gates['Conc_Place'][0])
-            composite_match = raw_match * conc_place
+            composite_match = raw_match
             slam_surprise = float(1.0 - np.exp(-5.0 * (1.0 - composite_match)))
             slam_vis_csnn = jnp.array(debug_gates['Debug_Input_CSNN'][0])
             slam_vis_stdp = jnp.array(debug_gates['Debug_Input_STDP'][0])
@@ -1676,14 +1701,16 @@ def train():
             except Exception as _fallback_err:
                 print(f"    [SLAM FALLBACK] error: {_fallback_err}")
             
-        # Update SOG for training agent-0 (outside JIT)
+        # Update SOG for training agent-0 (outside JIT) using 4 ToF beams (including back beam)
         try:
             s_u = robot0_np[0] * env._slam_scale + 1.0
             s_v = robot0_np[1] * env._slam_scale + 1.0
             s_th = robot0_np[2] - 1.0
+            _s_pos = jnp.array([s_u, s_v])
+            _s_tof = compute_tof_distance(_s_pos, s_th, env._segments, include_back=True)
             _hit, _free = _get_ray_indices(
                 s_u, s_v, s_th,
-                np.array(tof_jax[0]), [-np.pi/4, 0.0, np.pi/4],
+                np.array(_s_tof), [-np.pi/4, 0.0, np.pi/4, np.pi],
                 res=sog_system.res, grid_size=sog_system.grid_w, offset_m=sog_system.offset_m,
             )
             sog_state = sog_system.update(sog_state, jnp.array(_hit), jnp.array(_free))
@@ -1745,10 +1772,31 @@ def train():
             next_state, fresh_state
         )
 
-        # Randomize target for crashed agents
-        rng, k_fresh_tgt = jax.random.split(rng)
-        fresh_target_xy = jax.random.uniform(k_fresh_tgt, (Config.BATCH_SIZE, 2), minval=-0.8, maxval=0.8)
-        target_xy = jnp.where(reset_mask[:, None], fresh_target_xy, target_xy)
+        # Randomize target for crashed agents (ensure valid, obstacle-free target)
+        new_target_list = list(np.array(target_xy))
+        _reset_mask_np = np.array(reset_mask)
+        if _reset_mask_np.any():
+            for idx in range(Config.BATCH_SIZE):
+                if _reset_mask_np[idx]:
+                    rng, k_fresh_tgt = jax.random.split(rng)
+                    valid_tgt, _ = get_valid_target(k_fresh_tgt, _obs_np, float(env._slam_scale))
+                    new_target_list[idx] = np.array(valid_tgt)
+        
+        # Check if any non-crashed agent has reached its target (within 8cm)
+        _target_xy_np = np.array(target_xy)
+        _pos_xy_np = np.array(r_state[:, :2])
+        _dists_to_target = np.linalg.norm(_pos_xy_np - _target_xy_np, axis=1)
+        target_reached = (_dists_to_target < 0.08) & (~_reset_mask_np)
+        
+        if target_reached.any():
+            for idx in range(Config.BATCH_SIZE):
+                if target_reached[idx]:
+                    rng, k_tgt = jax.random.split(rng)
+                    valid_tgt, _ = get_valid_target(k_tgt, _obs_np, float(env._slam_scale))
+                    new_target_list[idx] = np.array(valid_tgt)
+                    print(f"🎯 [Agent {idx}] Reached target! Relocating to new valid target: {valid_tgt}")
+        
+        target_xy = jnp.array(new_target_list)
 
         # If any agent resets, we must update its SLAM pose to match its new spawn position
         if reset_mask.any():
@@ -1840,8 +1888,13 @@ def train():
             slam_pose, slam_surprise = _reset_slam_for_new_arena(
                 None, curr_state[0]  # all agents' new spawn states
             )
-            rng, k_tgt = jax.random.split(rng)
-            target_xy = jax.random.uniform(k_tgt, (Config.BATCH_SIZE, 2), minval=-0.8, maxval=0.8)
+            _obs_np = np.array(env._obstacles) if env._obstacles is not None else np.zeros((0, 4))
+            new_target_list = []
+            for idx in range(Config.BATCH_SIZE):
+                rng, k_tgt = jax.random.split(rng)
+                valid_tgt, _ = get_valid_target(rng, _obs_np, float(env._slam_scale))
+                new_target_list.append(np.array(valid_tgt))
+            target_xy = jnp.array(new_target_list)
 
         print(f"⚡ [SHAC EPOCH {i:04d}] Loss: {loss:.2e} (Act: {logs['act_loss']:.1e}, Crit: {logs['crit_loss']:.1e}) | Reward: {logs['rew']:.2f} | Time: {dt_epoch:.1f}s (Total: {total_elapsed/60:.1f}m)\n"
               f"   ├── Target Tracking Errors: Pos: {logs['pos']:.2f}m | Pitch: {logs['ang_th']:.2f} rad | Abdomen: {logs['ang_ab']:.2f} rad | MeanPos: [{mean_x:+.2f}, {mean_z:+.2f}]m\n"
@@ -1888,14 +1941,15 @@ def vis_step_fn(env, curr_state, curr_params, step_idx, slam_surprise, hover_par
     obs_v = obs_v.at[:, 2].set(wrapped_th)
     scaled_obs = symlog(obs_v)
     
-    # 2. Ingest visual-spatial belief features
+    # 2. Extract current weighted belief from the state's W_instar
     norm_csnn = vis_csnn
     norm_stdp = vis_stdp
     visual_features = (norm_csnn, norm_stdp)
     
-    next_state, weighted_belief = env.ingest_perceptual_streams(
-        curr_state, pose_belief, visual_features, jnp.zeros((B, 4))
-    )
+    W_instar = curr_state[4]
+    x_perceptual = jnp.concatenate([pose_belief, norm_csnn, norm_stdp], axis=-1)
+    weighted_belief = jnp.einsum('bip,bi->bp', W_instar, x_perceptual)
+    weighted_belief = jnp.clip(weighted_belief, -5.0, 5.0)
     
     combined_obs = jnp.concatenate([scaled_obs, weighted_belief], axis=-1)
     
@@ -1930,6 +1984,15 @@ def vis_step_fn(env, curr_state, curr_params, step_idx, slam_surprise, hover_par
         curr_params, combined_obs, None, SOG_v_mem, K_repel, emd_signals, 0.0, 0.0, slam_pos_batch, Config.K_INSTAR
     )
     
+    # Calculate feedback-only force (net force minus instar force) and saturate
+    u_brain_net = forces[:, 0, :] - forces[:, 2, :]
+    u_brain_saturated = jnp.tanh(u_brain_net / Config.FORCE_NORMALIZER)
+    
+    # Ingest perceptual streams to update W_instar using the actual control output
+    state_after_ingestion, _ = env.ingest_perceptual_streams(
+        curr_state, pose_belief, visual_features, u_brain_saturated
+    )
+    
     # --- LYAPUNOV HOVER & ATTENTION GATING (DNAG) ---
     # Clamp surprise to prevent gate saturation.
     sim_surprise = jnp.minimum(slam_surprise, Config.DNAG_MAX_SURPRISE)
@@ -1955,15 +2018,16 @@ def vis_step_fn(env, curr_state, curr_params, step_idx, slam_surprise, hover_par
         )
         
     blended_mods, alpha = jax.vmap(differentiable_attention_gate)(sim_surprise, mods, hover_mods)
-    alpha_floored = jnp.maximum(alpha, Config.DNAG_MIN_ALPHA)
-    blended_mods = (1.0 - alpha_floored) * mods + alpha_floored * hover_mods
+    alpha_blended = jnp.minimum(alpha, Config.DNAG_MAX_ALPHA)
+    alpha_blended = jnp.maximum(alpha_blended, Config.DNAG_MIN_ALPHA)
+    blended_mods = (1.0 - alpha_blended) * mods + alpha_blended * hover_mods
     
     # Blend the virtual forces using the same DNAG gate
-    blended_forces = (1.0 - alpha_floored) * forces + alpha_floored * hover_forces
-    blended_forces_no_emd = (1.0 - alpha_floored) * forces_no_emd + alpha_floored * hover_forces_no_emd
+    blended_forces = (1.0 - alpha_blended) * forces + alpha_blended * hover_forces
+    blended_forces_no_emd = (1.0 - alpha_blended) * forces_no_emd + alpha_blended * hover_forces_no_emd
 
     # 4. Env Step
-    next_state, _, f_nodal, w_pose, h_marker = env.step_batch(next_state, blended_mods, step_idx=step_idx)
+    next_state, _, f_nodal, w_pose, h_marker = env.step_batch(state_after_ingestion, blended_mods, step_idx=step_idx)
     
     # Compute SOG repulsive force
     f_repel = compute_sog_repulsive_force(slam_pos_batch, SOG_v_mem)
@@ -2016,7 +2080,7 @@ def vis_step_fn(env, curr_state, curr_params, step_idx, slam_surprise, hover_par
     centering_signal = emd_signals[:, 0]
     flow_corr = K_flow * centering_signal
     
-    return next_state, f_nodal, w_pose, h_marker, alpha_floored, f_repel_scaled, flow_corr, curr_emd_intensities, f_net_slam, f_brain_slam, f_emd_slam, f_instar_slam
+    return next_state, f_nodal, w_pose, h_marker, alpha_blended, f_repel_scaled, flow_corr, curr_emd_intensities, f_net_slam, f_brain_slam, f_emd_slam, f_instar_slam
 
 if __name__ == "__main__":
     import argparse

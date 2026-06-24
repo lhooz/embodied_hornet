@@ -38,7 +38,7 @@ def _make_telemetry_step(original_forward_step):
         # Compute surprise from debug gates (same formula as original)
         raw_match = float(debug_gates['Raw_Match'][0])
         conc_place = float(debug_gates['Conc_Place'][0])
-        composite_match = raw_match * conc_place
+        composite_match = raw_match
         import numpy as np
         surprise = float(1.0 - np.exp(-5.0 * (1.0 - composite_match)))
 
