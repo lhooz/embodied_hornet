@@ -565,6 +565,10 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
         sim_data['active_places'].append(last_active_places)
         sim_data['slam_est'].append((slam_est_u, slam_est_v, slam_est_th))
         sim_data['surprise'].append(last_slam_surprise)
+        # Sanity check: flag significant SLAM-GT divergence
+        _div = np.sqrt((slam_est_u - slam_u)**2 + (slam_est_v - slam_v)**2)
+        if _div > 0.05:
+            print(f"  ⚠️ [DIVERGENCE] Frame {i}: GT=({slam_u:.3f},{slam_v:.3f}) SLAM=({slam_est_u:.3f},{slam_est_v:.3f}) dist={_div:.3f}m")
         # Compute events at every frame (463 Hz) for smooth DVS display
         _vis_slam_pos = jnp.array([slam_u, slam_v])
         _vis_int, _, _, _ = compute_pixel_readings(
