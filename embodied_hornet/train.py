@@ -322,10 +322,23 @@ def run_visualization(env, params, update_idx, vis_step_fn, pbt_state=None, curr
     # Copy the SLAM system if provided, otherwise create a new one
     if slam_system is not None:
         vis_slam = copy.deepcopy(slam_system)
-        last_slam_est_u = float(slam_pose[0, 0])
-        last_slam_est_v = float(slam_pose[0, 1])
-        last_slam_est_th = float(slam_pose[0, 2])
-        print(f"    -> Deepcopied Agent 0 SLAM system from training run at pose ({last_slam_est_u:.2f}, {last_slam_est_v:.2f})")
+        # Always initialize from the actual physical state to prevent
+        # accumulated training SLAM drift from leaking into the visualization.
+        # reset_pose_only preserves learned Hebbian map weights (W_seq_to_place).
+        r_state_np_start = np.array(state[0][0])
+        start_slam_x = float(r_state_np_start[0]) * env._slam_scale + 1.0
+        start_slam_z = float(r_state_np_start[1]) * env._slam_scale + 1.0
+        start_slam_th = float(r_state_np_start[2]) - 1.0
+        env._prev_robot_state = None
+        vis_slam.reset_pose_only(1)
+        vis_slam.initialize_pose(
+            jnp.array([[start_slam_x, start_slam_z]]),
+            jnp.array([start_slam_th]),
+        )
+        last_slam_est_u = start_slam_x
+        last_slam_est_v = start_slam_z
+        last_slam_est_th = start_slam_th
+        print(f"    -> Re-initialized SLAM pose to Agent 0 GT: ({start_slam_x:.2f}, {start_slam_z:.2f}), heading {start_slam_th:.2f} rad")
     else:
         from snn_slam_system import SNNSLAMSystem
         vis_slam = SNNSLAMSystem(jax.random.PRNGKey(update_idx + 999), n_depth=N_DEPTH)
