@@ -429,7 +429,7 @@ class FlyEnv:
         # --- 4. Safety Penalty (The "Electric Fence") ---
         wall_limit = 0.20
         violation = jax.nn.relu(dist - wall_limit)
-        penalty_scale = 20.0 * w_pos
+        penalty_scale = 3.0 * w_pos
         rew_safety = -penalty_scale * violation
 
         # --- 5. Other Dynamic Costs (Negative) ---

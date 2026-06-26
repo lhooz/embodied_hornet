@@ -190,6 +190,40 @@ def get_valid_target(rng_key, obstacles_np, slam_scale, minval=-0.8, maxval=0.8)
             return candidate, k
 
 
+def get_valid_target_near(rng_key, agent_pos_phys, obstacles_np, slam_scale,
+                          max_radius=0.5, min_radius=0.15,
+                          arena_min=-0.8, arena_max=0.8):
+    """
+    Samples a target within [min_radius, max_radius] of the agent's current
+    physical position.  Candidate is clipped to arena bounds and rejected if
+    it falls inside an obstacle.  This limits the Critic shock magnitude when
+    targets switch by keeping the new value landscape close to the old one.
+    """
+    import numpy as np
+    agent_np = np.array(agent_pos_phys).ravel()[:2]
+    k = rng_key
+    for _ in range(200):  # safety cap
+        k, k_angle, k_dist = jax.random.split(k, 3)
+        angle = float(jax.random.uniform(k_angle, (), minval=0.0, maxval=2.0 * np.pi))
+        dist  = float(jax.random.uniform(k_dist, (), minval=min_radius, maxval=max_radius))
+        cx = float(np.clip(agent_np[0] + dist * np.cos(angle), arena_min + 1e-4, arena_max - 1e-4))
+        cz = float(np.clip(agent_np[1] + dist * np.sin(angle), arena_min + 1e-4, arena_max - 1e-4))
+        candidate = jnp.array([cx, cz])
+        # Verify not inside an obstacle
+        sx = cx * slam_scale + 1.0
+        sz_c = cz * slam_scale + 1.0
+        if len(obstacles_np) == 0:
+            return candidate, k
+        in_obs = np.any(
+            (obstacles_np[:, 0] <= sx) & (obstacles_np[:, 2] >= sx) &
+            (obstacles_np[:, 1] <= sz_c) & (obstacles_np[:, 3] >= sz_c)
+        )
+        if not in_obs:
+            return candidate, k
+    # Fallback: uniform sampling if proximity sampling keeps failing (dense obstacle field)
+    return get_valid_target(k, obstacles_np, slam_scale)
+
+
 # ==============================================================================
 # 2. MODEL DEFINITION
 # ==============================================================================
@@ -1253,7 +1287,7 @@ def train():
             _use_hover_specialist = False
             hover_fixed_params    = None
 
-    def loss_fn(params, start_state, pbt_weights, key, slam_pose, slam_surprise, obstacles, vis_csnn, vis_stdp, SOG_v_mem, target_xy):
+    def loss_fn(params, start_state, pbt_weights, key, slam_pose, slam_surprise, obstacles, vis_csnn, vis_stdp, SOG_v_mem, target_xy, target_switch_ages=None):
         """
         Computes the total loss over the trajectory horizon.
         Includes policy gradient, value function loss, and auxiliary force matching loss.
@@ -1489,7 +1523,15 @@ def train():
         _, _, final_val_actor = jax.vmap(ac_model.apply)(params, final_combined_obs)
         final_val_actor = jnp.squeeze(final_val_actor)
         
-        actor_term = jnp.mean(weighted_loss - (Config.GAMMA**Config.HORIZON * final_val_actor))
+        per_agent_actor = weighted_loss - (Config.GAMMA**Config.HORIZON * final_val_actor)
+        # Dampen Actor gradient for agents whose targets recently switched.
+        # The Critic continues learning at full speed; only the Actor is gated
+        # to prevent the stale bootstrap V(s_32) from corrupting the policy.
+        if target_switch_ages is not None:
+            damp_weights = jnp.minimum(target_switch_ages / 5.0, 1.0)  # ramp 0→1 over 5 epochs
+        else:
+            damp_weights = jnp.ones(Config.BATCH_SIZE)
+        actor_term = jnp.mean(damp_weights * per_agent_actor)
 
         final_val_target = jax.lax.stop_gradient(final_val_actor)
         discounted_return = jnp.dot(discounts, rewards_scaled) + (Config.GAMMA**Config.HORIZON * final_val_target)
@@ -1528,11 +1570,11 @@ def train():
     _SLAM_OFFSET_TRAIN = 1.0  # physical: hornet ±ARENA_W → SLAM [0, 2m]
 
     @jax.jit
-    def update(params, opt_state, full_state, pbt_state, key, slam_pose, slam_surprise, obstacles, vis_csnn, vis_stdp, SOG_v_mem, target_xy):
+    def update(params, opt_state, full_state, pbt_state, key, slam_pose, slam_surprise, obstacles, vis_csnn, vis_stdp, SOG_v_mem, target_xy, target_switch_ages=None):
         key_loss, key_next = jax.random.split(key)
         
         (loss, (logs, next_state)), grads = jax.value_and_grad(loss_fn, has_aux=True)(
-            params, full_state, pbt_state.weights, key_loss, slam_pose, slam_surprise, obstacles, vis_csnn, vis_stdp, SOG_v_mem, target_xy
+            params, full_state, pbt_state.weights, key_loss, slam_pose, slam_surprise, obstacles, vis_csnn, vis_stdp, SOG_v_mem, target_xy, target_switch_ages
         )
         
         updates, new_opt = optimizer.update(grads, opt_state, params)
@@ -1559,6 +1601,10 @@ def train():
         valid_tgt, _ = get_valid_target(rng, _obs_np, float(env._slam_scale))
         new_target_list.append(np.array(valid_tgt))
     target_xy = jnp.array(new_target_list)
+
+    # Per-agent counter: epochs since last target switch.  Starts high so the
+    # Actor gradient is fully engaged from the beginning (no unnecessary damping).
+    target_switch_ages = np.full(Config.BATCH_SIZE, 100.0)
     
     # --- Initialise SLAM System ---
     # One SNNSLAMSystem tracks agent-0's trajectory and provides real pose + surprise
@@ -1645,8 +1691,10 @@ def train():
         params, opt_state, loss, logs, next_state, pbt_state, key_explore = update(
             params, opt_state, curr_state, pbt_state, key_explore,
             slam_pose, jnp.array(slam_surprise), env._obstacles, slam_vis_csnn, slam_vis_stdp, jnp.array(sog_state.v_mem),
-            target_xy
+            target_xy, jnp.array(target_switch_ages)
         )
+        # Increment per-agent target switch ages (will be reset to 0 on target switch below)
+        target_switch_ages += 1.0
 
         # 1b. SLAM update (outside JIT, runs on agent-0's terminal state)
         # Compute sensor bundle from the final state of this horizon
@@ -1790,6 +1838,7 @@ def train():
                     rng, k_fresh_tgt = jax.random.split(rng)
                     valid_tgt, _ = get_valid_target(k_fresh_tgt, _obs_np, float(env._slam_scale))
                     new_target_list[idx] = np.array(valid_tgt)
+                    target_switch_ages[idx] = 0.0  # reset damping counter for crashed agent
         
         # Check if any non-crashed agent has reached its target (within 8cm)
         _target_xy_np = np.array(target_xy)
@@ -1801,9 +1850,14 @@ def train():
             for idx in range(Config.BATCH_SIZE):
                 if target_reached[idx]:
                     rng, k_tgt = jax.random.split(rng)
-                    valid_tgt, _ = get_valid_target(k_tgt, _obs_np, float(env._slam_scale))
+                    agent_phys_pos = np.array(r_state[idx, :2])
+                    valid_tgt, _ = get_valid_target_near(
+                        k_tgt, agent_phys_pos, _obs_np, float(env._slam_scale),
+                        max_radius=0.5, min_radius=0.15
+                    )
                     new_target_list[idx] = np.array(valid_tgt)
-                    print(f"🎯 [Agent {idx}] Reached target! Relocating to new valid target: {valid_tgt}")
+                    target_switch_ages[idx] = 0.0  # reset damping counter
+                    print(f"🎯 [Agent {idx}] Reached target! Relocating nearby: {valid_tgt}")
         
         target_xy = jnp.array(new_target_list)
 
@@ -1904,6 +1958,7 @@ def train():
                 valid_tgt, _ = get_valid_target(rng, _obs_np, float(env._slam_scale))
                 new_target_list.append(np.array(valid_tgt))
             target_xy = jnp.array(new_target_list)
+            target_switch_ages = np.full(Config.BATCH_SIZE, 100.0)  # no damping after forced reset
 
         print(f"⚡ [SHAC EPOCH {i:04d}] Loss: {loss:.2e} (Act: {logs['act_loss']:.1e}, Crit: {logs['crit_loss']:.1e}) | Reward: {logs['rew']:.2f} | Time: {dt_epoch:.1f}s (Total: {total_elapsed/60:.1f}m)\n"
               f"   ├── Target Tracking Errors: Pos: {logs['pos']:.2f}m | Pitch: {logs['ang_th']:.2f} rad | Abdomen: {logs['ang_ab']:.2f} rad | MeanPos: [{mean_x:+.2f}, {mean_z:+.2f}]m\n"
